@@ -2,7 +2,7 @@
 // [배관] 띄움. 플레이어가 띄움 태그를 받으면 자동으로 발동한다 (키로 발동하지 않음). 모든 직업 공용.
 //
 // ─────────────────────────────────────────────────────────────────────────────
-// [흐름] (서버)  예) 보스 내려찍기, GE_CC_Airborne { DownDuration 1.0, Distance 600 } (Launch Height 250, Air Time 1.0)
+// [흐름] (서버 기준. 맞은 사람 컴퓨터가 하는 일은 아래 [네트워크])  예) 보스 내려찍기, GE_CC_Airborne { DownDuration 1.0, Distance 600 } (Launch Height 250, Air Time 1.0)
 //
 //   B가 맞음 → GE_CC_Airborne → B에게 State.CrowdControl.Push.Airborne → 이 Ability 발동 (Trigger = 태그가 붙음)
 //     (GE의 시간은 안전용 최대 시간뿐. 끝내는 쪽은 언제나 이 Ability → EndAbility가 띄움 GE를 지운다)
@@ -15,7 +15,7 @@
 //          → 높이를 바꿔도 누워 있는 시간은 같다 (2026-10-20 사용자 결정 B)
 //          이제 띄움 GE는 Ignore 조건에 걸려 안 붙는다 (데미지는 들어감)
 //          착지하면 그 자리에서 멈춘다 (미끄러짐 없음). 착지점이 낭떠러지 밖이면 1.0초 뒤부터 보통 낙하 → 낙사 가능
-//     ④ 1.0초 뒤 → 기상 몽타주 → 끝나면 종료 (EndAbility가 Down·띄움·이동 금지 GE를 지움). 무적 없음
+//     ④ 1.0초 뒤 → State.CrowdControl.Push.GettingUp GE (복제) + 기상 몽타주 → 끝나면 종료 (EndAbility가 Down·일어남·띄움·이동 금지 GE를 지움). 무적 없음
 //          누움 태그는 완전히 일어날 때까지 남는다 (2026-10-20 사용자 결정):
 //          일어나는 중에도 기상기가 나가고, 회피는 막히고, 맞아도 안 뜬다
 //   기상기(ULOAGA_WakeUp): 누워 있을 때 스페이스 → 이 Ability를 끊는다(Cancel Abilities with Tag)
@@ -31,10 +31,17 @@
 // [왜 GE가 아니라 이 GA가 날리나] GE는 "붙어 있다"만 한다. 날리기·착지·기상 순서는 흐름이라 GA가 쥔다 (흐름은 GA).
 //
 // ─────────────────────────────────────────────────────────────────────────────
-// [네트워크]
-//   1. 서버만     : 발동, 취소, 궤적 숫자 정하기, 착지 판단, 누움 GE, 기상 시각
-//   2. 복제       : 띄움·누움·이동 금지 태그 (GE), 몽타주, 궤적 숫자 (이동 컴포넌트의 CrowdControlMove, B에게만)
-//   3. 각자 할 일 : 궤적 걸기, 때린 쪽 바라보기 (서버와 B 컴퓨터가 같은 숫자로)
+// [네트워크] (2026-10-23 바꿈: ServerOnly → ServerInitiated)
+//   왜: 엔진은 "내가 조종하는 캐릭터"의 복제 몽타주를 버린다 (UAbilitySystemComponent::OnRep_ReplicatedAnimMontage,
+//       내 컴퓨터가 예측으로 이미 틀었다고 본다). ServerOnly면 B 컴퓨터에서 트는 쪽이 없어 B 화면에서만 모션이 안 나왔다.
+//       → 서버가 발동하면 B 컴퓨터에서도 이 GA가 돈다. B 컴퓨터는 몽타주만 맡는다.
+//   발동은 서버만 한다 (태그로 발동하는 ServerInitiated GA는 엔진이 서버에서만 발동시키고 B 컴퓨터에 "너도 실행" 전달).
+//   끝내는 것도 서버만 (NetSecurityPolicy ServerOnly → B 컴퓨터가 먼저 끝나도 서버 GA는 안 끝남). 서버가 끝내면 B도 끝남.
+//
+//   1. 서버만     : 이동 금지·누움·일어남 GE, 궤적 숫자 정하기, 공중 재발사, 누운 시간 재기, 끝내기, 정리
+//   2. 복제       : 띄움·누움·일어남·이동 금지 태그 (GE), 궤적 숫자 (CrowdControlMove, B에게만), 남의 화면용 몽타주
+//   3. 각자 할 일 : 궤적 걸기, 때린 쪽 바라보기 (이동 컴포넌트)
+//                   B 컴퓨터의 이 GA: 다른 스킬 끊기, 몽타주 Air → (자기 착지 또는 누움 태그) Down → (일어남 태그) GetUp
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // [BP에서 설정할 것] GA_Airborne (부모: LOAGA_Airborne)
@@ -82,6 +89,11 @@ protected:
 		bool bReplicateEndAbility,
 		bool bWasCancelled) override;
 	//~ End UGameplayAbility Interface
+
+	//~ Begin ULOAGameplayAbility Interface
+	/** 예측 피격 반응은 공중 섹션부터 */
+	virtual FName GetPredictionStartSection() const override { return AirSection; }
+	//~ End ULOAGameplayAbility Interface
 
 	// ---------- 데이터 (GA_Airborne BP의 Class Defaults에서 조정) ----------
 
@@ -140,8 +152,17 @@ private:
 	UFUNCTION()
 	void OnAirborneMontageEnded();
 
-	/** 몽타주 섹션으로 점프 (몽타주·섹션이 있을 때만) */
+	/** 몽타주 섹션으로 점프 (몽타주·섹션이 있을 때만). 서버는 복제되는 GAS 점프, B 컴퓨터는 내 화면만 */
 	void JumpToSectionIfAny(FName Section);
+
+	/** [B 컴퓨터] 누움 태그가 붙음 → 아직 공중으로 보고 있으면 Down 구간 (내 착지 알림을 놓쳤을 때 대비) */
+	void OnDownTagChangedOnOwner(const FGameplayTag Tag, int32 NewCount);
+
+	/** [B 컴퓨터] 일어남 태그가 붙음 → GetUp 구간 (누운 시간은 서버만 알아서 태그로 따라간다) */
+	void OnGettingUpTagChangedOnOwner(const FGameplayTag Tag, int32 NewCount);
+
+	/** 서버에서 도는 GA인가 (리슨 호스트 포함). 아니면 맞은 사람(B) 컴퓨터 */
+	bool IsServerSide() const;
 
 	/** 내가 서버에서 붙인 GE를 지운다 (번호표를 비움) */
 	void RemoveOwnedEffect(FActiveGameplayEffectHandle& InOutHandle) const;
@@ -164,7 +185,14 @@ private:
 	/** 누움(State.CrowdControl.Push.Down) GE 번호표. 종료 때 지운다 (일어나는 동안에도 유지) */
 	FActiveGameplayEffectHandle DownEffectHandle;
 
+	/** 일어남(State.CrowdControl.Push.GettingUp) GE 번호표 [서버]. 종료 때 지운다 */
+	FActiveGameplayEffectHandle GettingUpEffectHandle;
+
 	/** 알림 구독 번호 (종료 때 해제) */
 	FDelegateHandle EffectAppliedHandle;
 	FDelegateHandle AirborneTagHandle;
+
+	/** [B 컴퓨터] 누움·일어남 태그 알림 번호 (종료 때 해제) */
+	FDelegateHandle DownTagHandleOnOwner;
+	FDelegateHandle GettingUpTagHandleOnOwner;
 };

@@ -6,6 +6,7 @@
 
 #include "Components/SceneComponent.h"
 #include "Components/BillboardComponent.h"
+#include "Components/ArrowComponent.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(LOALocationMarker)
 
@@ -28,6 +29,12 @@ ALOALocationMarker::ALOALocationMarker(const FObjectInitializer& ObjectInitializ
 	if (EditorIcon)
 	{
 		EditorIcon->SetupAttachment(RootComponent);
+	}
+
+	EditorArrow = CreateEditorOnlyDefaultSubobject<UArrowComponent>(TEXT("EditorArrow"));
+	if (EditorArrow)
+	{
+		EditorArrow->SetupAttachment(RootComponent);
 	}
 #endif
 }

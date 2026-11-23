@@ -55,6 +55,14 @@ public class LOA : ModuleRules
 		{
 			"Slate",
 			"SlateCore",
+
+			// 레이드 결과 "나가기": Game Default Map(로비)을 읽는다 (UGameMapsSettings, 2026-11-15). 엔진 모듈이라 플러그인 켤 것 없음
+			"EngineSettings",
+
+			// 파티 찾기 (2026-11-19 apply131): 목록 = LAN 세션(OnlineSubsystem), 신청~입장 = Beacon(OnlineSubsystemUtils)
+			// 플러그인이라 .uproject에서도 켠다 (OnlineSubsystem / OnlineSubsystemUtils / OnlineSubsystemNull)
+			"OnlineSubsystem",
+			"OnlineSubsystemUtils",
 		});
 
 		// 이후 단계에서 필요해지면 여기에 추가한다. (지금은 넣지 않음)

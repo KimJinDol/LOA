@@ -40,7 +40,11 @@
 //
 //   ② 루프 없음 (Loop Section = None) - 루프 애니메이션이 없을 때. 아무 공격 애니메이션 하나로도 만들 수 있다.
 //      [Charge_Start ■]      [Release]
-//      - 첫 섹션이 끝나기 직전에 몽타주를 멈추고(재생 속도 0), 그 자세로 뗄 때까지 기다린다.
+//      - 첫 섹션이 끝나기 직전에 몽타주를 멈추고(재생 속도 거의 0 = LOAChargeFreeze::FrozenPlayRate), 그 자세로 뗄 때까지 기다린다.
+//        정확히 0이 아닌 이유: 엔진이 속도 0인 동안 지난 시간을 몽타주 안에 쌓아 두었다가
+//        속도를 되돌리는 순간 한꺼번에 써 버린다 → Release 섹션이 순식간에 지나가 끝부분만 보임 (2026-11-01 버그)
+//        (엔진 AnimMontage.cpp FAnimMontageInstance::Advance: 매 프레임 AddEvaluationTime(DeltaTime), 최대 10초까지 /
+//         FMontageSubStepper::Advance: 속도가 0이면 그 시간을 쓰지 않고 NotMoved로 나감. 둘 다 virtual이 아니라 바꿀 수 없음)
 //      - 첫 섹션의 다음 섹션은 비워 둔다. (Release로 이어 두면 안 뗐는데 발사됨 → 저장 시 오류)
 //      - 블렌드 아웃이 시작되기 전에 멈춰야 하므로 실제로는 섹션 끝보다 (블렌드 아웃 시간 + 약간) 앞에서 멈춘다.
 //
@@ -60,6 +64,12 @@
 //   Release 섹션의 Hit 노티파이 → Apply 모듈 → 공격력 × DamageRate × ChargeMultiplier
 //
 //   - 차지 중에는 돌지 않는다. (방향은 누르는 순간에만 정해짐)
+//
+// [차지 게이지 UI] (2026-10-31)
+//   조종하는 사람 컴퓨터에서 ASC에 신호를 보낸다 (OptionalObject = 이 GA). ULOAOverlayWidgetController가 받아 위젯에 알린다
+//     차지 시작 → Event.Skill.Charge.Started   (게이지 보이기. 숫자 = MakeChargeGaugeInfo)
+//     뗌        → Event.Skill.Charge.Released  (원래 있던 신호. 도달 단계 = GetReachedStageCount, 퍼펙트)
+//     떼기 전 끝 → Event.Skill.Charge.Cancelled (게이지 숨기기)
 //   - 회피로 끊으면 Task와 몽타주는 Ability와 함께 정리된다. 쿨타임은 이미 돌고 있다.
 //
 // ─────────────────────────────────────────────────────────────────────────────
@@ -96,6 +106,35 @@ struct FLOAChargeStage
 	float Multiplier = 1.f;
 };
 
+/**
+ * 차지 게이지 UI가 쓰는 숫자 (이 차지 GA 설정값 복사). ULOAOverlayWidgetController가 차지 시작 때 받는다
+ * 예) 단계 [0.8, 1.6], 최대 2.0, 퍼펙트 1.6 ~ 1.8
+ */
+USTRUCT(BlueprintType)
+struct FLOAChargeGaugeInfo
+{
+	GENERATED_BODY()
+
+	/** 최대 차지 시간 (초). 이 시간이 되면 자동 발사 */
+	UPROPERTY(BlueprintReadOnly, Category = "LOA|UI|Charge")
+	float MaxChargeTime = 0.f;
+
+	/** 단계 시각 (초, 오름차순). 단계식이면 여러 개, 비율식이면 1개, 없으면 비어 있음 */
+	UPROPERTY(BlueprintReadOnly, Category = "LOA|UI|Charge")
+	TArray<float> StageTimes;
+
+	/** 퍼펙트 존을 쓰나 */
+	UPROPERTY(BlueprintReadOnly, Category = "LOA|UI|Charge")
+	bool bUsePerfectZone = false;
+
+	/** 퍼펙트 존 (초) */
+	UPROPERTY(BlueprintReadOnly, Category = "LOA|UI|Charge")
+	float PerfectZoneStart = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "LOA|UI|Charge")
+	float PerfectZoneEnd = 0.f;
+};
+
 UCLASS(Abstract)
 class LOA_API ULOAGA_Charge : public ULOAPlayerAbility
 {
@@ -120,11 +159,27 @@ public:
 	 */
 	float CalculateChargeMultiplier(float HeldTime, bool& bOutPerfect) const;
 
+	/** 차지 게이지 UI용 숫자 (설정값 복사). 헤더 [차지 게이지 UI] */
+	FLOAChargeGaugeInfo MakeChargeGaugeInfo() const;
+
+	/** 누른 시간까지 채운 단계 수. 예) 단계 [0.8, 1.6], 1.0초 → 1 / 비율식 [1.5], 1.5초 이상 → 1 */
+	int32 GetReachedStageCount(float HeldTime) const;
+
 protected:
 	//~ Begin ULOAPlayerAbility Interface
 	/** 몽타주 재생 + 차지 대기 Task 시작 */
 	virtual void StartSkill() override;
 	//~ End ULOAPlayerAbility Interface
+
+	//~ Begin UGameplayAbility Interface
+	/** 떼기 전에 끝나면(회피·CC) 조종하는 사람 컴퓨터에 Event.Skill.Charge.Cancelled (차지 게이지 숨기기) */
+	virtual void EndAbility(
+		const FGameplayAbilitySpecHandle Handle,
+		const FGameplayAbilityActorInfo* ActorInfo,
+		const FGameplayAbilityActivationInfo ActivationInfo,
+		bool bReplicateEndAbility,
+		bool bWasCancelled) override;
+	//~ End UGameplayAbility Interface
 
 	// ---------- 데이터 (각 차지 스킬 BP에서) ----------
 
@@ -190,7 +245,7 @@ private:
 	 */
 	float GetChargeFreezeDelay() const;
 
-	/** 멈출 시간이 됨 → 재생 속도 0 */
+	/** 멈출 시간이 됨 → 재생 속도 거의 0 (LOAChargeFreeze::FrozenPlayRate. 헤더 상단 [몽타주] ②) */
 	UFUNCTION()
 	void OnChargeFreeze();
 
@@ -203,4 +258,11 @@ private:
 
 	/** 이번 발동의 차지 배율. StartSkill에서 1로 초기화, OnChargeReleased에서 확정 */
 	float ChargeMultiplier = 1.f;
+
+	/** 이번 발동에서 차지를 시작했나 / 뗐나 (끊김 알림용) */
+	bool bChargeStarted = false;
+	bool bChargeReleased = false;
+
+	/** [조종하는 사람 컴퓨터] 차지 게이지 UI 신호 (Started / Cancelled). 다른 컴퓨터에서는 아무것도 안 함 */
+	void SendChargeUIEvent(const FGameplayTag& EventTag) const;
 };

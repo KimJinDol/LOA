@@ -64,7 +64,7 @@ namespace LOATelegraphSubsystem
 	}
 }
 
-int32 ULOATelegraphSubsystem::ShowToAll(const UObject* WorldContextObject, FLOATelegraphData Data, float SecondsUntilHit)
+int32 ULOATelegraphSubsystem::ShowToAll(const UObject* WorldContextObject, FLOATelegraphData Data, float SecondsUntilHit, float SecondsHitAfterFill)
 {
 	UWorld* World = LOATelegraphSubsystem::GetServerWorld(WorldContextObject);
 
@@ -79,9 +79,10 @@ int32 ULOATelegraphSubsystem::ShowToAll(const UObject* WorldContextObject, FLOAT
 	LastTelegraphId = (LastTelegraphId == MAX_int32) ? 1 : LastTelegraphId + 1;
 	Data.TelegraphId = LastTelegraphId;
 
-	// ② 시각 (서버 시계). 예) 지금 100.0 + 1.2초 → 101.2에 꽉 참
+	// ② 시각 (서버 시계). 예) 지금 100.0 + 1.2초 → 101.2에 판정. 꽉 참 = 판정 − 꽉 찬 뒤 시간 (헤더 [꽉 참 ≠ 판정])
 	Data.StartServerTime = LOANetTime::GetServerTimeNow(World);
 	Data.HitServerTime = Data.StartServerTime + SecondsUntilHit;
+	Data.FillServerTime = Data.HitServerTime - FMath::Clamp(static_cast<double>(SecondsHitAfterFill), 0.0, static_cast<double>(SecondsUntilHit));
 
 	// ③ 모든 플레이어 화면으로 (Reliable)
 	const int32 NumSent = LOATelegraphSubsystem::ForEachPlayerCombatRPC(World,
@@ -150,15 +151,25 @@ void ULOATelegraphSubsystem::Deinitialize()
 // 그리기 / 지우기
 // =============================================================================
 
-void ULOATelegraphSubsystem::ShowTelegraph(const FLOATelegraphData& Data)
+void ULOATelegraphSubsystem::ShowTelegraph(const FLOATelegraphData& InData)
 {
-	if (!CanDraw() || !Data.Style)
+	if (!CanDraw() || !InData.Style)
 	{
 		return;
 	}
 
-	// 받는 사이에 이미 판정 시각이 지났으면(아주 늦게 도착) 그리지 않는다.
-	if (Data.HitServerTime <= GetServerTimeNow())
+	// 보스 모션에 맞춰 그리는 예고: 이 컴퓨터의 시각으로 옮긴다 (헤더 [보스 모션에 맞춰 그리기])
+	FLOATelegraphData Data = InData;
+	if (Data.bSyncWithBossMotion)
+	{
+		const double Delay = GetBossMotionDelay();
+		Data.StartServerTime += Delay;
+		Data.FillServerTime += Delay;
+		Data.HitServerTime += Delay;
+	}
+
+	// 받는 사이에 이미 꽉 찰 시각이 지났으면(아주 늦게 도착, 또는 예고가 왕복보다 짧음) 그리지 않는다.
+	if (Data.HitServerTime <= GetTelegraphTimeNow())
 	{
 		return;
 	}
@@ -206,6 +217,7 @@ void ULOATelegraphSubsystem::ShowTelegraph(const FLOATelegraphData& Data)
 	Entry.Telegraph = Telegraph;
 	Entry.TelegraphId = Data.TelegraphId;
 	Entry.HitServerTime = Data.HitServerTime;
+	Entry.Data = Data;
 
 	const int32 InsertIndex = Algo::UpperBoundBy(Active, Data.HitServerTime, &FLOAActiveTelegraph::HitServerTime);
 	Active.Insert(Entry, InsertIndex);
@@ -255,7 +267,7 @@ void ULOATelegraphSubsystem::Tick(float DeltaTime)
 
 	// ② 판정 시각이 지난 예고를 풀로. 빠른 순으로 줄 서 있으므로 앞에서부터 지난 것까지만 본다.
 	//    예) [101.2, 101.5, 103.0] 지금 101.3 → 앞 1개만 돌려놓고 멈춤
-	const double Now = GetServerTimeNow();
+	const double Now = GetTelegraphTimeNow();
 	int32 NumExpired = 0;
 	while (NumExpired < Active.Num() && Active[NumExpired].HitServerTime <= Now)
 	{
@@ -264,7 +276,17 @@ void ULOATelegraphSubsystem::Tick(float DeltaTime)
 	}
 	if (NumExpired > 0)
 	{
+		// ③ 판정 알림은 목록을 정리한 뒤에 (듣는 쪽이 새 예고를 띄워도 안전하게)
+		TArray<FLOATelegraphData, TInlineAllocator<4>> HitData;
+		for (int32 Index = 0; Index < NumExpired; ++Index)
+		{
+			HitData.Add(Active[Index].Data);
+		}
 		Active.RemoveAt(0, NumExpired, EAllowShrinking::No);
+		for (const FLOATelegraphData& Data : HitData)
+		{
+			OnTelegraphHit.Broadcast(Data);
+		}
 	}
 }
 
@@ -278,10 +300,26 @@ bool ULOATelegraphSubsystem::CanDraw() const
 	return World && World->GetNetMode() != NM_DedicatedServer;
 }
 
-double ULOATelegraphSubsystem::GetServerTimeNow() const
+double ULOATelegraphSubsystem::GetTelegraphTimeNow() const
 {
-	// 클라는 엔진 추정값 + 핑 ÷ 2 (자세한 이유는 LOANetTime.h)
-	return LOANetTime::GetServerTimeNow(GetWorld());
+	// 서버 시각 (클라는 엔진 추정값 + 편도, LOANetTime.h) + 내 편도 + 여유 (앞당김, 헤더 [예고 앞당김])
+	//   예) 편도 0.1, 여유 0.04 → 서버 판정 101.2인 예고가 내 화면에서는 서버 시각 101.06에 꽉 찬다
+	//   리슨 호스트·스탠드얼론은 편도 0, 여유도 0 (서버 위치 = 자기 위치)
+	const UWorld* World = GetWorld();
+	const bool bRemoteClient = World && World->GetNetMode() == NM_Client;
+	const double Margin = bRemoteClient ? GetDefault<ULOATelegraphSettings>()->LeadMargin : 0.0;
+	return LOANetTime::GetServerTimeNow(World) + LOANetTime::GetOneWayLatency(World) + Margin;
+}
+
+double ULOATelegraphSubsystem::GetBossMotionDelay() const
+{
+	// 편도 + 여유(예고 앞당김 되돌리기) + 편도(보스 모션이 늦게 보이는 만큼). 리슨 호스트·스탠드얼론은 0
+	const UWorld* World = GetWorld();
+	if (!World || World->GetNetMode() != NM_Client)
+	{
+		return 0.0;
+	}
+	return LOANetTime::GetOneWayLatency(World) * 2.0 + GetDefault<ULOATelegraphSettings>()->LeadMargin;
 }
 
 void ULOATelegraphSubsystem::WriteServerTime()
@@ -300,7 +338,7 @@ void ULOATelegraphSubsystem::WriteServerTime()
 	UMaterialParameterCollectionInstance* Instance = World ? World->GetParameterCollectionInstance(TimeCollection) : nullptr;
 	if (Instance)
 	{
-		Instance->SetScalarParameterValue(LOATelegraphSubsystem::Param_ServerTime, static_cast<float>(GetServerTimeNow()));
+		Instance->SetScalarParameterValue(LOATelegraphSubsystem::Param_ServerTime, static_cast<float>(GetTelegraphTimeNow()));
 	}
 }
 

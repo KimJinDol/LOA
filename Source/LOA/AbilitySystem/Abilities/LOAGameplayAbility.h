@@ -17,7 +17,7 @@
 // (C++ 파일 위치를 옮겨도 클래스 이름이 같으면 BP 에셋은 영향 없음)
 //
 // 여기에는 "플레이어든 보스든 쓰는 것"만 둔다.
-//   공통 기본값 : 인스턴스 정책, 죽어 있으면 발동 불가 (ActivationBlockedTags에 State.Dead)
+//   공통 기본값 : 인스턴스 정책, 죽어 있으면 발동 불가 (ActivationBlockedTags에 State.Body.Dead)
 //   공통 도우미 : 내 LOA ASC 가져오기, 위치 쪽으로 돌기(FaceLocation)
 //                 다른 Ability 모두 취소(CancelOtherAbilities), 상태 태그 붙이기(ApplyStateTagsToSelf) — 사망·스턴처럼 "몸 상태" Ability가 쓴다
 //   공통 동작   : 몽타주 재생 + 끝나면 Ability 종료
@@ -49,6 +49,10 @@
 // - 스킬마다 쿨타임 GE를 만들지 않는다. (직업 3 × 스킬 6 = 18개) GE는 하나, 값은 Ability BP가 가진다.
 // - 쿨타임은 발동하는 순간(CommitAbility) 시작한다. 취소돼도 이미 돌고 있다.
 // - CooldownDuration이 0이면 쿨타임 없음. (평타)
+// - 숫자는 FScalableFloat (2026-11-08): 칸에 숫자를 바로 적거나, 커브 테이블 행을 가리킨다 (가로축 = 스킬 레벨)
+//     예) CooldownDuration [ 1 ] × CT_SkillValues / Berserker.Whirlwind.Cooldown
+//   마나(ULOAPlayerAbility::ManaCost)·데미지 계수(Apply 모듈 DamageRate)와 같은 방식 → 스킬 숫자를 커브 테이블 한 곳에서 조정
+//   직업마다 쿨이 다른 회피·기상은 직업별 GA(같은 C++의 BP 자식)로 둔다. 진짜 공용 GA(사망, CC, 저가)는 쿨이 없다
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // [몽타주 - Montage / PlayMontageAndEnd]
@@ -57,6 +61,9 @@
 //   - "언제" 재생할지는 자식이 정한다. 부모는 재생 도구만 준다.
 //       평타: 커서 위치를 받은 뒤 재생 / 차지 스킬: 키를 뗀 뒤 재생 …
 //   - 몽타주가 여러 개인 Ability(콤보, 차지 단계)는 자식이 자기 설정값을 따로 추가한다.
+//   - 직업마다 다른 몽타주 (2026-11-08): Montage Tag를 적으면 시전자 직업 데이터의 몽타주 표에서 먼저 찾는다.
+//       ① 직업 표에 그 태그가 있음 → 표의 몽타주   ② 없음(보스·잡몹 포함) → 이 GA의 Montage
+//       그래서 런타임 코드는 Montage를 바로 읽지 않고 GetMontage()를 쓴다. (저장 시 검사만 기본 Montage)
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // [스킬 모듈 - Modules]
@@ -69,6 +76,10 @@
 //
 //   모듈 창구 (모듈이 주인에게 묻는 것) : HasSkillModuleAuthority, MakeSkillModuleContext
 //   차지 배율 창구 : GetChargeMultiplier (기본 1, 차지 GA만 덮어씀)
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// [툴팁 숫자] (2026-11-14) UI가 클래스 기본값(CDO)에서 읽기만 한다. 발동과 무관
+//   GetCooldownAtLevel : 그 레벨의 CooldownDuration (칸이 여기 있어서 여기. 마나·데미지 계수는 ULOAPlayerAbility)
 
 #pragma once
 
@@ -94,6 +105,9 @@ public:
 	/** 이 Ability가 들어 있는 LOA ASC. 없으면 nullptr */
 	UFUNCTION(BlueprintPure, Category = "LOA|Ability")
 	ULOAAbilitySystemComponent* GetLOAAbilitySystemComponentFromActorInfo() const;
+
+	/** 그 레벨의 쿨타임 (초). 0 = 쿨타임 없음. 헤더 [툴팁 숫자] */
+	float GetCooldownAtLevel(float Level) const { return CooldownDuration.GetValueAtLevel(Level); }
 
 	//~ Begin UGameplayAbility Interface
 	/** 이 Ability의 쿨타임 태그. GAS가 "쿨타임 중인지" 검사할 때, UI가 남은 시간을 물을 때 쓴다. */
@@ -131,6 +145,12 @@ public:
 	virtual float GetChargeMultiplier() const { return 1.f; }
 
 	/**
+	 * [서버] 이 스킬이 보낸 효과가 판정 1번에 대상 1명 이상에게 들어갔다 (ULOACombatLibrary::ApplyPayloads가 부름, 2026-11-09)
+	 * bHitEnemy = 그중 적이 있었나. 기본은 아무것도 안 함. 플레이어 스킬이 아이덴티티 게이지를 채운다 (ULOAPlayerAbility)
+	 */
+	virtual void NotifyPayloadsApplied(bool bHitEnemy) {}
+
+	/**
 	 * 지금부터 이 Ability 몽타주의 EventTag 노티파이(LOA Send Gameplay Event)까지 남은 시간 (초, 재생 속도 반영).
 	 * 몽타주가 재생 중이면 지금 위치부터, 아직 시작 전이면(On Skill Start 모듈) 처음부터 센다.
 	 *   예) 노티파이가 1.2초 지점, 재생 속도 0.8 → 1.5
@@ -139,6 +159,34 @@ public:
 	 * @return 몽타주가 없거나, 지금 이후에 그 노티파이가 없으면 false
 	 */
 	bool GetTimeUntilMontageEvent(const FGameplayTag& EventTag, float& OutSeconds) const;
+
+	/**
+	 * 지금 시전자가 틀 몽타주. ① 시전자 직업 표의 Montage Tag 몽타주 → ② 없으면 이 GA의 Montage (헤더 [몽타주])
+	 * 발동 전 원본(CDO)에서 부르면 시전자를 모르니 ②. 원본에서 쓰는 곳은 GetMontageFor로 시전자를 넘긴다.
+	 */
+	UAnimMontage* GetMontage() const;
+
+	/**
+	 * 이 시전자가 틀 몽타주. GetMontage와 같은 순서지만 시전자를 직접 받는다.
+	 * 쓰는 곳: 예측 피격 반응 (ULOACrowdControlPredictionComponent::PredictCrowdControl). 진짜 GA가 고를 몽타주와 같아야 이어받는다
+	 */
+	UAnimMontage* GetMontageFor(const AActor* Avatar) const;
+
+	/** 몽타주 재생 속도 */
+	float GetMontagePlayRate() const { return MontagePlayRate; }
+
+	/**
+	 * 이 모듈이 Modules의 몇 번째인가. 없으면 INDEX_NONE (2026-11-02)
+	 * 쓰는 곳: 공격 보고 (ULOASkillModule_Apply). 한 GA에 Apply 모듈이 여러 개면 서버가 "몇 번째 모듈의 보고인가"로 맞춘다.
+	 * 번호는 GA 에셋의 칸 순서라 내 컴퓨터와 서버가 같다.
+	 */
+	int32 GetSkillModuleIndex(const ULOASkillModule* Module) const;
+
+	/** 예측 피격 반응이 몽타주를 시작할 섹션. 기본 = 처음부터. 띄움 = Air (ULOAGA_Airborne) */
+	virtual FName GetPredictionStartSection() const { return NAME_None; }
+
+	/** 이 Ability가 무엇으로 발동하나 (엔진 AbilityTriggers는 protected). 예측 피격 반응이 "이 GE가 붙이는 태그로 발동하는 GA"를 찾을 때 */
+	const TArray<FAbilityTriggerData>& GetAbilityTriggers() const { return AbilityTriggers; }
 
 #if WITH_EDITOR
 	/**
@@ -195,30 +243,54 @@ protected:
 
 	/**
 	 * 상태 태그를 GE로 나에게 붙인다. [서버] 태그는 GAS가 모든 컴퓨터에 복제한다.
-	 *   Duration > 0  : 그 시간 뒤 스스로 사라짐 (ULOAGE_TimedTags)  예) 스턴 3초 → State.CrowdControl.Debuff.Stunned
-	 *   Duration <= 0 : 지울 때까지 남음        (ULOAGE_InfiniteTags) 예) 사망 → State.Dead (지우는 쪽 = 부활)
+	 *   Duration > 0  : 그 시간 뒤 스스로 사라짐 (ULOAGE_TimedTags)  예) 스턴 3초 → State.CrowdControl.Status.Stunned
+	 *   Duration <= 0 : 지울 때까지 남음        (ULOAGE_InfiniteTags) 예) 사망 → State.Body.Dead (지우는 쪽 = 부활)
 	 * 발동 중(ActivateAbility 이후)에만 부른다.
 	 * @return GE 번호표 (일찍 지울 때 RemoveActiveGameplayEffect). 실패하면 무효 번호표
 	 */
 	FActiveGameplayEffectHandle ApplyStateTagsToSelf(const FGameplayTagContainer& Tags, float Duration = 0.f);
 
+	/**
+	 * 몸(Avatar)을 그 자리에 세운다: 캐릭터 이동 멈춤 + AI 길 찾기 멈춤 (2026-11-18 apply122, ULOAGA_Stun에서 옮김)
+	 *   AI는 길 찾기를 안 멈추면 이동 컴포넌트를 세워도 다음 틱에 다시 걸어간다
+	 *   쓰는 곳: 스턴(ULOAGA_Stun), 대난투 그로기(ULOAGA_BossBrawl)
+	 */
+	void StopAvatarMovement() const;
+
+	/**
+	 * Montage를 틀기만 한다. 몽타주가 끝나거나 끊겨도 Ability는 끝내지 않는다. Ability가 끝나면 몽타주도 멈춘다 (2026-11-18, ULOAGA_Stun에서 옮김)
+	 *   끝나는 때를 몽타주가 아니라 다른 것(태그, 대난투 끝)이 정하는 Ability용. 반복 섹션 몽타주를 넣는다
+	 * @return Montage가 비어 있으면 false
+	 */
+	bool PlayMontageOnly();
+
 	// ---------- 데이터 (각 Ability BP의 Class Defaults에서 조정) ----------
 
-	/** 재생할 몽타주. 비어 있으면 몽타주를 쓰지 않는 Ability */
+	/** 재생할 몽타주 (기본). 비어 있으면 몽타주를 쓰지 않는 Ability. 직업 표에 Montage Tag가 있으면 그쪽이 먼저 */
 	UPROPERTY(EditDefaultsOnly, Category = "LOA|Ability|Montage")
 	TObjectPtr<UAnimMontage> Montage;
+
+	/**
+	 * (선택) 직업 몽타주 표에서 찾을 태그. 비우면 항상 Montage. (2026-11-08)
+	 * 예) GA_bk_Dodge: Montage Tag = Montage.Dodge → 세라스는 DA_Class_Serath의 Montage.Dodge 몽타주
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "LOA|Ability|Montage", meta = (Categories = "Montage"))
+	FGameplayTag MontageTag;
 
 	/** 몽타주 재생 속도. (공격 속도 스탯이 생기면 그 값으로 대체 가능) */
 	UPROPERTY(EditDefaultsOnly, Category = "LOA|Ability|Montage", meta = (ClampMin = "0.1"))
 	float MontagePlayRate = 1.f;
 
-	/** 쿨타임 시간 (초). 0이면 쿨타임 없음. 캐릭터 레벨과 상관없이 고정 */
-	UPROPERTY(EditDefaultsOnly, Category = "LOA|Ability|Cooldown", meta = (ClampMin = "0.0", Units = "Seconds"))
-	float CooldownDuration = 0.f;
+	/**
+	 * 쿨타임 시간 (초). 0이면 쿨타임 없음. (2026-11-08: float → FScalableFloat)
+	 * 숫자를 바로 적거나, 커브 테이블 행을 가리킨다 (가로축 = 스킬 레벨). 헤더 [쿨타임]
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "LOA|Ability|Cooldown")
+	FScalableFloat CooldownDuration;
 
 	/**
 	 * 쿨타임 동안 ASC에 붙는 태그. 스킬마다 달라야 한다. 이름 규칙: Cooldown.<주인>.<스킬 이름>
-	 * 플레이어 스킬: Cooldown.Berserker.Whirlwind / 공용 회피: Cooldown.Dodge / 보스: Cooldown.<보스 이름>.<패턴 이름>
+	 * 플레이어 스킬: Cooldown.Berserker.Whirlwind / 공용 회피: Cooldown.Common.Dodge / 보스: Cooldown.<보스 이름>.<패턴 이름>
 	 * 키(Q, W)가 아니라 스킬 기준이다. 스킬 슬롯을 옮겨도 바꾸지 않는다.
 	 * 여러 개를 넣으면 공유 쿨타임 (예: 이동기 두 개가 같은 태그를 함께 가짐)
 	 */

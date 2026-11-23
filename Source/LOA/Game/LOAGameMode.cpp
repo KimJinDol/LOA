@@ -1,9 +1,13 @@
 // LOAGameMode.cpp
 
 #include "Game/LOAGameMode.h"
+#include "Game/LOAGameState.h"
 #include "Character/Player/LOACharacter.h"
 #include "Data/LOACharacterClassData.h"
+#include "Data/LOACharacterSelection.h"
 #include "Core/LOALog.h"
+
+#include "Engine/AssetManager.h"
 
 #include "GameFramework/Controller.h"
 #include "GameFramework/Pawn.h"
@@ -16,6 +20,9 @@ ALOAGameMode::ALOAGameMode(const FObjectInitializer& ObjectInitializer)
 {
 	// Pawn / PlayerController / PlayerState 클래스는 여기서 정하지 않는다.
 	// 설정값(IMC, InputConfig 등)은 BP 쪽에 있으므로 BP_LOAGameMode에서 BP 클래스들을 지정한다.
+
+	// GameState는 설정할 값이 없어서 C++ 클래스를 기본값으로 둔다. (공용 부활 목숨)
+	GameStateClass = ALOAGameState::StaticClass();
 }
 
 APawn* ALOAGameMode::SpawnDefaultPawnFor_Implementation(AController* NewPlayer, AActor* StartSpot)
@@ -70,9 +77,59 @@ APawn* ALOAGameMode::SpawnDefaultPawnFor_Implementation(AController* NewPlayer, 
 	return NewPawn;
 }
 
+FString ALOAGameMode::InitNewPlayer(APlayerController* NewPlayerController, const FUniqueNetIdRepl& UniqueId, const FString& Options, const FString& Portal)
+{
+	FString ErrorMessage = Super::InitNewPlayer(NewPlayerController, UniqueId, Options, Portal);
+	if (!ErrorMessage.IsEmpty())
+	{
+		return ErrorMessage;
+	}
+
+	// 로비를 거쳐 왔으면 주소에 ?Class=DA_Class_Berserker 가 있다 (ULOALocalPlayer::GetGameLoginOptions)
+	const FLOACharacterSelection Selection = FLOACharacterSelection::FromLoginOptions(Options);
+	if (!Selection.IsValid())
+	{
+		// 로비를 거치지 않은 접속 (PIE 다인 등) → 스폰 때 TestClasses
+		return ErrorMessage;
+	}
+
+	if (const ULOACharacterClassData* ClassData = FindSelectedClassData(Selection))
+	{
+		// 스폰(ChooseClassData)이 이 표에서 꺼낸다
+		AssignedClasses.Add(NewPlayerController, ClassData);
+		LOA_LOG(this, Log, TEXT("Assigned class [%s] to [%s] from login options."), *GetNameSafe(ClassData), *GetNameSafe(NewPlayerController));
+	}
+	else
+	{
+		// 접속은 막지 않는다. 직업만 TestClasses로
+		LOA_LOG(this, Warning, TEXT("Unknown class [%s] in login options from [%s]. Falling back to TestClasses."),
+			*Selection.ClassId.ToString(), *GetNameSafe(NewPlayerController));
+	}
+	return ErrorMessage;
+}
+
+const ULOACharacterClassData* ALOAGameMode::FindSelectedClassData(const FLOACharacterSelection& Selection) const
+{
+	// 클라가 보낸 글자라 믿지 않는다: 에셋 매니저 목록에 있는 CharacterClass이고, 정말 직업 데이터인 것만
+	if (!Selection.IsValid() || Selection.ClassId.PrimaryAssetType != ULOACharacterClassData::GetPrimaryAssetTypeName() || !UAssetManager::IsInitialized())
+	{
+		return nullptr;
+	}
+
+	// 목록에 없는 이름이면 빈 경로 (DefaultGame.ini에 CharacterClass 등록이 필요)
+	const FSoftObjectPath AssetPath = UAssetManager::Get().GetPrimaryAssetPath(Selection.ClassId);
+	if (AssetPath.IsNull())
+	{
+		return nullptr;
+	}
+
+	// 직업 데이터는 작고 TestClasses가 이미 들고 있어 대개 메모리에 있다 → 바로 불러온다
+	return Cast<ULOACharacterClassData>(AssetPath.TryLoad());
+}
+
 const ULOACharacterClassData* ALOAGameMode::ChooseClassData(AController* Player)
 {
-	// 부활: 이전에 배정한 직업을 그대로 돌려준다.
+	// 부활 또는 로비에서 고르고 들어옴(InitNewPlayer가 적어 둠): 적어 둔 직업을 그대로 돌려준다.
 	if (const TObjectPtr<const ULOACharacterClassData>* Found = AssignedClasses.Find(Player))
 	{
 		return *Found;
@@ -83,7 +140,7 @@ const ULOACharacterClassData* ALOAGameMode::ChooseClassData(AController* Player)
 		return nullptr;
 	}
 
-	// 신규: 접속 순서대로 목록에서 하나씩. 끝까지 가면 처음으로 돌아간다.
+	// 로비를 거치지 않은 신규: 접속 순서대로 목록에서 하나씩. 끝까지 가면 처음으로 돌아간다.
 	const ULOACharacterClassData* Chosen = TestClasses[NextClassIndex % TestClasses.Num()];
 	++NextClassIndex;
 

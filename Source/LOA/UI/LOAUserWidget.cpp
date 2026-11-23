@@ -30,6 +30,7 @@ void ULOAUserWidget::SetWidgetController(UObject* InWidgetController)
 		});
 	}
 
-	// ② 자기 BP 이벤트. 이 시점에 자식들은 이미 컨트롤러를 받았다.
+	// ② 자기 C++ → BP 이벤트. 이 시점에 자식들은 이미 컨트롤러를 받았다.
+	NativeOnWidgetControllerSet();
 	OnWidgetControllerSet();
 }

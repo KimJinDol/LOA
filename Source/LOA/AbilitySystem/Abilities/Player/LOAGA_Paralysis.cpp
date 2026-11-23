@@ -1,6 +1,7 @@
 // LOAGA_Paralysis.cpp
 
 #include "AbilitySystem/Abilities/Player/LOAGA_Paralysis.h"
+#include "Combat/LOACrowdControlPredictionComponent.h"
 #include "AbilitySystem/Effects/LOAGE_Paralysis.h"
 #include "Character/Player/LOACharacterMovementComponent.h"
 #include "Core/LOAGameplayTags.h"
@@ -18,8 +19,8 @@
 ULOAGA_Paralysis::ULOAGA_Paralysis(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
-	// 서버만 실행한다 (띄움과 같음). B 컴퓨터는 태그·몽타주·위치 보정으로 결과를 받는다
-	NetExecutionPolicy = EGameplayAbilityNetExecutionPolicy::ServerOnly;
+	// 서버가 발동하고, 맞은 사람 컴퓨터에서도 같이 돈다 (그쪽은 몽타주만). 헤더 [네트워크]
+	NetExecutionPolicy = EGameplayAbilityNetExecutionPolicy::ServerInitiated;
 	NetSecurityPolicy = EGameplayAbilityNetSecurityPolicy::ServerOnly;
 
 	// 발동 조건: 경직 태그가 붙는 순간 (0 → 1). 경직 중 또 맞아 개수만 늘 때는 발동하지 않는다 → 그건 OnEffectAppliedToSelf가
@@ -28,9 +29,12 @@ ULOAGA_Paralysis::ULOAGA_Paralysis(const FObjectInitializer& ObjectInitializer)
 	ParalysisTrigger.TriggerSource = EGameplayAbilityTriggerSource::OwnedTagAdded;
 	AbilityTriggers.Add(ParalysisTrigger);
 
-	SetAssetTags(FGameplayTagContainer(LOAGameplayTags::Ability_CrowdControl_Paralysis));
+	// 취소하지 않을 성질 (2026-11-09): 아이덴티티처럼 CC를 맞아도 켜져 있어야 하는 Ability
+	AbilityTagsToKeep.AddTag(LOAGameplayTags::Ability_Trait_KeepOnCC);
 
-	// 죽어 있으면 발동 불가 (부모 생성자의 State.Dead 그대로)
+	SetAssetTags(FGameplayTagContainer(LOAGameplayTags::Ability_Common_Paralysis));
+
+	// 죽어 있으면 발동 불가 (부모 생성자의 State.Body.Dead 그대로)
 }
 
 // =============================================================================
@@ -52,8 +56,33 @@ void ULOAGA_Paralysis::ActivateAbility(
 		return;
 	}
 
-	// ① 하던 일 멈추기 + 이동 금지 (GE라 B 컴퓨터에도 복제 → 클릭 이동이 멈춘다)
+	// ① 하던 일 멈추기 [둘 다] (B 컴퓨터도 끊어야 내 화면에서 바로 끊긴다)
 	CancelOtherAbilities(AbilityTagsToKeep);
+
+	// [B 컴퓨터] 피해자 판정에서 내가 먼저 경직을 예측했으면 이어받는다 (예측 몽타주가 재생 중이면 그 위치부터)
+	//   ULOACrowdControlPredictionComponent
+	float ResumeTime = -1.f;
+	if (!IsServerSide())
+	{
+		if (ULOACrowdControlPredictionComponent* PredictionComp = GetAvatarActorFromActorInfo()->FindComponentByClass<ULOACrowdControlPredictionComponent>())
+		{
+			ResumeTime = PredictionComp->ConfirmPrediction(GetMontage());
+		}
+	}
+
+	// ③ 몽타주 [둘 다]. 서버 → 남의 화면, B 컴퓨터 → 내 화면. 끝나도 Ability는 계속 (경직 시간이 흐름을 정한다)
+	PlayParalysisMontage(FMath::Max(0.f, ResumeTime));
+
+	if (!IsServerSide())
+	{
+		// [B 컴퓨터만] "또 맞음"을 복제 도착으로 알아챈다 → 몽타주 처음부터. 나머지(시간·밀기·끝내기)는 서버가 한다
+		bOwnerSawFirstEffect = (FindNewestParalysisEffect() != nullptr);
+		EffectAddedHandleOnOwner = ASC->OnActiveGameplayEffectAddedDelegateToSelf.AddUObject(this, &ThisClass::OnEffectAddedOnOwner);
+		return;
+	}
+
+	// 여기부터 [서버만]
+	// 이동 금지 (GE라 B 컴퓨터에도 복제 → 클릭 이동이 멈춘다)
 	BlockMoveEffectHandle = ApplyStateTagsToSelf(FGameplayTagContainer(LOAGameplayTags::State_Block_Move));
 
 	// 알림 구독: 또 맞음 / 경직 태그가 다 빠짐(안전 시간 등)
@@ -61,9 +90,6 @@ void ULOAGA_Paralysis::ActivateAbility(
 	ParalysisTagHandle = ASC->RegisterGameplayTagEvent(
 		LOAGameplayTags::State_CrowdControl_Paralysis, EGameplayTagEventType::AnyCountChange)
 		.AddUObject(this, &ThisClass::OnParalysisTagChanged);
-
-	// ③ 몽타주. 끝나도 Ability는 계속 (경직 시간이 흐름을 정한다). Ability가 끝나면 몽타주도 멈춘다
-	PlayParalysisMontage();
 
 	// ② 처음 경직: 방금 붙은 경직 GE (태그가 붙는 순간 발동했으므로 이미 목록에 있다)
 	if (const FActiveGameplayEffect* Newest = FindNewestParalysisEffect())
@@ -98,27 +124,48 @@ void ULOAGA_Paralysis::EndAbility(
 		EffectAppliedHandle.Reset();
 		ParalysisTagHandle.Reset();
 
+		// [B 컴퓨터] 도착 알림 해제
+		if (ASC)
+		{
+			ASC->OnActiveGameplayEffectAddedDelegateToSelf.Remove(EffectAddedHandleOnOwner);
+		}
+
+		// [B 컴퓨터] 예측으로 붙인 이동 금지를 푼다 (진짜 이동 금지 GE도 이 GA와 같이 끝난다)
+		const AActor* Avatar = ActorInfo ? ActorInfo->AvatarActor.Get() : nullptr;
+		if (ULOACrowdControlPredictionComponent* PredictionComp = Avatar ? Avatar->FindComponentByClass<ULOACrowdControlPredictionComponent>() : nullptr;
+			PredictionComp && !IsServerSide())
+		{
+			PredictionComp->EndPrediction();
+		}
+		EffectAddedHandleOnOwner.Reset();
+		bOwnerSawFirstEffect = false;
+
 		if (const UWorld* World = GetWorld())
 		{
 			World->GetTimerManager().ClearTimer(ParalysisTimer);
 		}
 
-		RemoveOwnedEffect(BlockMoveEffectHandle);
-
-		// 밀리는 중에 끊겼으면(띄움·사망) 밀림도 지운다. 띄움이면 띄움 궤적이 이미 덮어써서 아무 일 없다
-		//   (주의: 띄움이 먼저 궤적을 걸고 나서 이 Ability가 끊기면 띄움 궤적을 지우게 된다 → 띄움은 다른 Ability를 먼저 끊고 나서 발사한다)
-		if (ACharacter* Character = Cast<ACharacter>(ActorInfo ? ActorInfo->AvatarActor.Get() : nullptr))
+		// 여기부터 [서버만]: 붙인 GE 지우기, 밀림 끝내기. (B 컴퓨터는 결과를 복제로 받는다)
+		//   B 컴퓨터에서 하면 안 되는 이유 예) 경직 중 띄움 → B 컴퓨터의 띄움 GA가 이 GA를 끊음 → 여기서 궤적을 지우면 방금 받은 띄움 궤적이 지워진다
+		if (IsServerSide())
 		{
-			if (ULOACharacterMovementComponent* Movement = Cast<ULOACharacterMovementComponent>(Character->GetCharacterMovement()))
+			RemoveOwnedEffect(BlockMoveEffectHandle);
+
+			// 밀리는 중에 끊겼으면(띄움·사망) 밀림도 지운다. 띄움이면 띄움 궤적이 이미 덮어써서 아무 일 없다
+			//   (주의: 띄움이 먼저 궤적을 걸고 나서 이 Ability가 끊기면 띄움 궤적을 지우게 된다 → 띄움은 다른 Ability를 먼저 끊고 나서 발사한다)
+			if (ACharacter* Character = Cast<ACharacter>(ActorInfo ? ActorInfo->AvatarActor.Get() : nullptr))
 			{
-				Movement->StopCrowdControlMove();
+				if (ULOACharacterMovementComponent* Movement = Cast<ULOACharacterMovementComponent>(Character->GetCharacterMovement()))
+				{
+					Movement->StopCrowdControlMove();
+				}
 			}
-		}
 
-		// 경직 GE를 모두 지운다 (정상 종료든, 띄움·사망으로 끊겼든) → 경직 태그가 빠져 회피·스킬이 다시 된다
-		if (ASC)
-		{
-			ASC->RemoveActiveEffectsWithGrantedTags(FGameplayTagContainer(LOAGameplayTags::State_CrowdControl_Paralysis));
+			// 경직 GE를 모두 지운다 (정상 종료든, 띄움·사망으로 끊겼든) → 경직 태그가 빠져 회피·스킬이 다시 된다
+			if (ASC)
+			{
+				ASC->RemoveActiveEffectsWithGrantedTags(FGameplayTagContainer(LOAGameplayTags::State_CrowdControl_Paralysis));
+			}
 		}
 
 		CurrentParalysisHandle.Invalidate();
@@ -215,9 +262,10 @@ void ULOAGA_Paralysis::PushFromEffect(const FGameplayEffectSpec& Spec, float Dis
 	LOA_LOG(Character, Log, TEXT("[Paralysis] Push: %.0fcm in %.2fs, dir (%.2f, %.2f)"), Distance, PushDuration, Direction.X, Direction.Y);
 }
 
-void ULOAGA_Paralysis::PlayParalysisMontage()
+void ULOAGA_Paralysis::PlayParalysisMontage(float StartTimeSeconds)
 {
-	if (!Montage)
+	UAnimMontage* MontageToPlay = GetMontage();
+	if (!MontageToPlay)
 	{
 		return;
 	}
@@ -230,7 +278,8 @@ void ULOAGA_Paralysis::PlayParalysisMontage()
 
 	// 서버가 새로 틀면 "새로 재생" 신호가 복제돼 다른 화면에서도 처음부터 나온다
 	UAbilityTask_PlayMontageAndWait* NewTask = UAbilityTask_PlayMontageAndWait::CreatePlayMontageAndWaitProxy(
-		this, NAME_None, Montage, MontagePlayRate, NAME_None, /*bStopWhenAbilityEnds*/ true);
+		this, NAME_None, MontageToPlay, MontagePlayRate, NAME_None, /*bStopWhenAbilityEnds*/ true,
+		/*AnimRootMotionTranslationScale*/ 1.f, StartTimeSeconds);
 	NewTask->ReadyForActivation();
 	MontageTask = NewTask;
 }
@@ -286,6 +335,30 @@ void ULOAGA_Paralysis::OnParalysisTagChanged(const FGameplayTag Tag, int32 NewCo
 		LOA_LOG(GetAvatarActorFromActorInfo(), Warning, TEXT("[Paralysis] Tag removed before the timer. Ending."));
 		EndAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo, true, false);
 	}
+}
+
+void ULOAGA_Paralysis::OnEffectAddedOnOwner(UAbilitySystemComponent* TargetASC, const FGameplayEffectSpec& Spec, FActiveGameplayEffectHandle ActiveHandle)
+{
+	if (!Cast<const ULOAGE_Paralysis>(Spec.Def.Get()))
+	{
+		return;
+	}
+
+	// 발동 RPC가 GE 복제보다 먼저 오면, 이번 발동의 첫 GE가 여기로 온다 → 다시 틀지 않고 기억만
+	if (!bOwnerSawFirstEffect)
+	{
+		bOwnerSawFirstEffect = true;
+		return;
+	}
+
+	// 경직 중 또 경직 → 몽타주 처음부터 (서버의 StartParalysis(bRestart)와 같은 모습)
+	PlayParalysisMontage();
+}
+
+bool ULOAGA_Paralysis::IsServerSide() const
+{
+	const FGameplayAbilityActorInfo* Info = GetCurrentActorInfo();
+	return Info && Info->IsNetAuthority();
 }
 
 void ULOAGA_Paralysis::OnParalysisTimeFinished()

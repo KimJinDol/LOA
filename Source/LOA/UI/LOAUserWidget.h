@@ -31,6 +31,9 @@
 // - 게임 중에 코드/BP로 새로 만든 자식(예: 버프 아이콘)은 자동 전달 대상이 아니다. 만든 쪽이 직접 넣어 준다.
 // - 같은 컨트롤러가 다시 들어오면 무시한다. (알림이 두 번 바인딩되는 것 방지)
 //
+// [C++ 위젯] (2026-11-06) C++ 자식 클래스는 NativeOnWidgetControllerSet을 덮어써서 알림에 바인딩한다 (BP 이벤트보다 먼저 불린다)
+//   예) ULOAChargeGauge: 오버레이 컨트롤러의 OnChargeStarted / Released / Cancelled
+//
 // [왜 컨트롤러 타입이 UObject인가]
 // 위젯마다 받는 컨트롤러가 다르다. (내 화면 = Overlay, 나중에 파티창 / 보스 체력바 = 각자 다른 컨트롤러)
 // 부모 클래스는 하나로 두고, BP에서 필요한 타입으로 Cast해서 쓴다.
@@ -76,6 +79,9 @@ protected:
 	 */
 	UFUNCTION(BlueprintImplementableEvent, Category = "LOA|UI")
 	void OnWidgetControllerSet();
+
+	/** 컨트롤러가 들어왔다 (C++ 자식용). BP의 OnWidgetControllerSet보다 먼저 불린다 (2026-11-06) */
+	virtual void NativeOnWidgetControllerSet() {}
 
 private:
 	/** 이 위젯이 알림을 받는 컨트롤러. 소유는 HUD가 하고, 여기서는 참조만 들고 있는다. */

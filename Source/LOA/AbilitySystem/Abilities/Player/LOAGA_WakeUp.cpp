@@ -16,10 +16,10 @@ ULOAGA_WakeUp::ULOAGA_WakeUp(const FObjectInitializer& ObjectInitializer)
 
 	// 무적 없음 (사용자 결정). 회피가 넣어 둔 면역을 뺀다
 	ActivationOwnedTags.RemoveTag(LOAGameplayTags::State_Immune_Push);
-	ActivationOwnedTags.RemoveTag(LOAGameplayTags::State_Immune_Debuff);
+	ActivationOwnedTags.RemoveTag(LOAGameplayTags::State_Immune_Status);
 
 	// 발동하는 순간 띄움 GA를 끊는다 → 띄움 GA의 EndAbility가 띄움·누움·이동 금지 GE를 지운다 (서버)
-	CancelAbilitiesWithTag.AddTag(LOAGameplayTags::Ability_CrowdControl_Airborne);
+	CancelAbilitiesWithTag.AddTag(LOAGameplayTags::Ability_Common_Airborne);
 
 	// 회피보다 짧게 구른다 (BP에서 조정)
 	DodgeDistance = 300.f;

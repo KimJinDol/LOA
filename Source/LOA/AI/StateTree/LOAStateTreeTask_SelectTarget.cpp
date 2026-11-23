@@ -26,7 +26,7 @@ EStateTreeRunStatus FLOAStateTreeTask_SelectTarget::Tick(FStateTreeExecutionCont
 		return EStateTreeRunStatus::Running;
 	}
 
-	// 대상이 죽었거나(State.Dead) 사라졌으면 살아 있는 다른 적으로 바꾼다. 아무도 없으면(전멸) 실패 → 대기
+	// 대상이 죽었거나(State.Body.Dead) 사라졌으면 살아 있는 다른 적으로 바꾼다. 아무도 없으면(전멸) 실패 → 대기
 	LOA_LOG(InstanceData.Actor, Log, TEXT("[AI] Target lost. Reselect."));
 	return PickRandomTarget(InstanceData) ? EStateTreeRunStatus::Running : EStateTreeRunStatus::Failed;
 }

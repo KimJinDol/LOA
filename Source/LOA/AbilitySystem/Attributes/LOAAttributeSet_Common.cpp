@@ -2,11 +2,13 @@
 
 #include "AbilitySystem/Attributes/LOAAttributeSet_Common.h"
 #include "Library/LOACombatLibrary.h"
+#include "Combat/LOACombatNoticeSubsystem.h"
 #include "Core/LOAGameplayTags.h"
 #include "Core/LOALog.h"
 #include "GameplayEffectExtension.h"
 #include "Abilities/GameplayAbilityTypes.h"
 #include "AbilitySystemComponent.h"
+#include "GameplayEffect.h"
 #include "Net/UnrealNetwork.h"
 
 ULOAAttributeSet_Common::ULOAAttributeSet_Common()
@@ -25,8 +27,10 @@ void ULOAAttributeSet_Common::GetLifetimeReplicatedProps(TArray<FLifetimePropert
 	// 체력: 모두에게 복제 (파티창, 보스 체력바)
 	DOREPLIFETIME_CONDITION_NOTIFY(ULOAAttributeSet_Common, Health,    COND_None, REPNOTIFY_Always);
 	DOREPLIFETIME_CONDITION_NOTIFY(ULOAAttributeSet_Common, MaxHealth, COND_None, REPNOTIFY_Always);
+	// 보호막: 모두에게 복제 (파티창) (2026-11-07)
+	DOREPLIFETIME_CONDITION_NOTIFY(ULOAAttributeSet_Common, Shield,    COND_None, REPNOTIFY_Always);
 
-	// (마나는 ULOAAttributeSet_Mana로 옮겼다. 플레이어만 가지는 값이라서)
+	// (마나는 ULOAAttributeSet_Player(옛 Mana)로 옮겼다. 플레이어만 가지는 값이라서)
 }
 
 void ULOAAttributeSet_Common::PreAttributeChange(const FGameplayAttribute& Attribute, float& NewValue)
@@ -40,9 +44,9 @@ void ULOAAttributeSet_Common::PreAttributeChange(const FGameplayAttribute& Attri
 		const float Max = GetMaxHealth();
 		NewValue = (Max > 0.f) ? FMath::Clamp(NewValue, 0.f, Max) : FMath::Max(NewValue, 0.f);
 	}
-	else if (Attribute == GetMaxHealthAttribute())
+	else if (Attribute == GetMaxHealthAttribute() || Attribute == GetShieldAttribute())
 	{
-		// 최대 체력은 음수가 될 수 없다.
+		// 최대 체력, 보호막은 음수가 될 수 없다.
 		NewValue = FMath::Max(NewValue, 0.f);
 	}
 }
@@ -86,32 +90,71 @@ void ULOAAttributeSet_Common::PostGameplayEffectExecute(const FGameplayEffectMod
 
 		if (IncomingDamage > 0.f)
 		{
-			// ② (나중에) 보호막을 먼저 깎고 남은 만큼만 체력으로
+			// ② 보호막을 먼저 깎고 남은 만큼만 체력으로 (2026-11-07)
+			//    예) 보호막 200, 데미지 300 → 보호막 0, 체력 -100 / 보호막 500, 데미지 300 → 보호막 200, 체력 그대로
+			//    데미지 숫자와 사망 이벤트에는 들어온 데미지 전체를 쓴다 (보호막이 막은 몫 포함)
+			//    보호막은 보호막 GE들의 몫이라 값을 직접 깎지 않는다. 곧 끝날 GE부터 "깎인 양"을 늘린다 (ConsumeShield)
+			const float Absorbed = (GetShield() > 0.f) ? ConsumeShield(FMath::Min(GetShield(), IncomingDamage)) : 0.f;
+			const float HealthDamage = IncomingDamage - Absorbed;
 
 			// ③ 체력 감소. 0 아래로 내려가지 않는다.
 			const float Max = GetMaxHealth();
-			const float NewHealth = GetHealth() - IncomingDamage;
+			const float HealthBefore = GetHealth();
+			const float NewHealth = HealthBefore - HealthDamage;
 			SetHealth((Max > 0.f) ? FMath::Clamp(NewHealth, 0.f, Max) : FMath::Max(NewHealth, 0.f));
 
-			// ④ 때린 플레이어 화면에 데미지 숫자 (보낸 사람이 플레이어가 아니면 라이브러리가 무시)
-			//    맞은 지점: 히트 판정이 있는 공격이면 Context의 HitResult.
-			//    주기 GE(도트)의 틱은 처음 걸 때의 HitResult가 그대로 남아 있을 수 있다. 그 위치는 이미 지난 위치라 쓰지 않는다.
-			//    → 맞은 지점 없음으로 보내면 클라가 "내 캐릭터와 가장 가까운 점"에 띄운다.
-			const FGameplayEffectContextHandle& Context = Data.EffectSpec.GetContext();
-			const bool bIsPeriodicTick = Data.EffectSpec.GetPeriod() > 0.f;
-			const FHitResult* HitResult = bIsPeriodicTick ? nullptr : Context.GetHitResult();
-
-			ULOACombatLibrary::NotifyDamageDealt(
-				Context.GetInstigator(),
-				Data.Target.GetAvatarActor(),
-				IncomingDamage,
-				HitResult);
+			// ④ 전투 알림판에 "피해가 들어감" (2026-11-15 apply115. 전에는 데미지 숫자를 직접 불렀다)
+			//    듣는 쪽: 때린 플레이어 PC의 ULOACombatRPCComponent → 데미지 숫자 / 레이드 기록 → 준 피해·조력·파티가 맞은 양 (누가 듣는지 이 클래스는 모른다)
+			//    데미지 숫자 = 들어온 데미지 전체 / 레이드 기록 = 실제로 깎인 양 (보호막 + 체력, 넘친 양 뺌)
+			//      예) 체력 200에 900 → 숫자 900, 기록 200 / 보호막 200 + 체력 1000에 500 → 숫자 500, 기록 500
+			//    알림에 무엇을 담을지(맞은 지점, 공격 판정 기록 …)는 알림판이 만든다 (2026-11-18 apply125: 여기 있던 것을 옮김)
+			//    사망 이벤트(⑤)보다 먼저 → 보스를 죽인 마지막 한 방도 레이드 기록에 들어간다
+			if (ULOACombatNoticeSubsystem* CombatNotice = ULOACombatNoticeSubsystem::Get(&Data.Target))
+			{
+				CombatNotice->NotifyDamageApplied(ULOACombatNoticeSubsystem::MakeDamageInfo(Data, IncomingDamage, Absorbed + (HealthBefore - GetHealth())));
+			}
 
 			// ⑤ 체력이 처음 0이 됐으면 사망 이벤트 (받는 쪽이 무엇을 할지는 이 클래스가 모른다)
 			SendDeathEventIfJustDied(Data, IncomingDamage);
 
 			// (나중에) 피격 이벤트
 		}
+		return;
+	}
+
+	// ---------- 회복 입구 (메타, 2026-11-07) ----------
+	// ULOAHealExecution이 넣어 준 회복량을 꺼내서 Health에 더한다. 최대 체력까지.
+	if (Data.EvaluatedData.Attribute == GetHealingAttribute())
+	{
+		const float IncomingHealing = GetHealing();
+		SetHealing(0.f);
+
+		// 시체는 회복하지 않는다 (부활은 따로: ALOACharacter::ReviveFromDeath)
+		if (IncomingHealing <= 0.f || !ULOACombatLibrary::IsTargetable(Data.Target.GetAvatarActor()))
+		{
+			return;
+		}
+
+		const float Max = GetMaxHealth();
+		const float HealthBefore = GetHealth();
+		const float NewHealth = HealthBefore + IncomingHealing;
+		SetHealth((Max > 0.f) ? FMath::Min(NewHealth, Max) : NewHealth);
+
+		// 전투 알림판에 "회복함" (2026-11-15 apply115). 듣는 쪽: 받은 플레이어 PC의 ULOACombatRPCComponent → 회복 숫자(들어온 양, 2026-11-16) / 레이드 기록
+		//   실제로 채운 양 = 넘친 회복을 뺀 것. 예) 900/1000에서 300 → 100
+		if (ULOACombatNoticeSubsystem* CombatNotice = ULOACombatNoticeSubsystem::Get(&Data.Target))
+		{
+			FLOAHealAppliedInfo Info;
+			Info.Healer = Data.EffectSpec.GetContext().GetInstigator();
+			Info.Target = Data.Target.GetAvatarActor();
+			Info.TargetOwner = Data.Target.GetOwnerActor();	// 받은 사람별 구독의 열쇠 (플레이어면 PlayerState, 2026-11-16)
+			Info.IncomingHealing = IncomingHealing;
+			Info.HealedAmount = GetHealth() - HealthBefore;
+			CombatNotice->NotifyHealApplied(Info);
+		}
+
+		LOA_LOG(Data.Target.GetAvatarActor(), Log, TEXT("[Heal] +%.0f from %s -> health %.0f / %.0f"),
+			IncomingHealing, *GetNameSafe(Data.EffectSpec.GetContext().GetInstigator()), GetHealth(), Max);
 		return;
 	}
 
@@ -147,17 +190,112 @@ void ULOAAttributeSet_Common::SendDeathEventIfJustDied(const FGameplayEffectModC
 	//   Instigator : 막타를 친 쪽 (플레이어면 PlayerState, 보스면 보스 액터. 데미지 GE를 보낸 쪽 그대로)
 	//   Target     : 죽은 몸
 	FGameplayEventData Payload;
-	Payload.EventTag = LOAGameplayTags::Event_Death;
+	Payload.EventTag = LOAGameplayTags::Event_Trigger_Death;
 	Payload.Instigator = Data.EffectSpec.GetContext().GetInstigator();
 	Payload.Target = Data.Target.GetAvatarActor();
 	Payload.EventMagnitude = LastDamage;
 	Payload.ContextHandle = Data.EffectSpec.GetContext();
 
-	LOA_LOG(Payload.Target.Get(), Log, TEXT("[Death] Health reached 0. Sending Event.Death (killer: %s)"),
+	LOA_LOG(Payload.Target.Get(), Log, TEXT("[Death] Health reached 0. Sending Event.Trigger.Death (killer: %s)"),
 		*GetNameSafe(Payload.Instigator.Get()));
 
 	// 이 ASC의 구독자에게 알린다. Trigger가 Event.Death인 Ability(GA_Death)가 여기서 바로 발동한다.
 	ASC->HandleGameplayEvent(Payload.EventTag, &Payload);
+}
+
+float ULOAAttributeSet_Common::ConsumeShield(float Amount) const
+{
+	UAbilitySystemComponent* ASC = GetOwningAbilitySystemComponent();
+	const UWorld* World = ASC ? ASC->GetWorld() : nullptr;
+	if (Amount <= 0.f || !ASC || !World)
+	{
+		return 0.f;
+	}
+
+	// 보호막 GE 하나 = 한 줄. 남은 시간과 지금 몫을 적어 둔다
+	struct FShieldEntry
+	{
+		FActiveGameplayEffectHandle Handle;
+		TWeakObjectPtr<AActor> Giver;	// 이 보호막 GE를 보낸 사람 (전투 알림판 → 레이드 기록 "방어", 2026-11-15)
+		float TimeRemaining = 0.f;	// 기간 없음(무한)은 아주 큰 값 → 맨 뒤
+		float Amount = 0.f;			// 이 GE가 지금 얹은 몫
+		float Used = 0.f;			// SetByCaller.ShieldUsed (이미 깎인 양)
+	};
+	TArray<FShieldEntry> Entries;
+
+	const float WorldTime = World->GetTimeSeconds();
+	const TArray<FActiveGameplayEffectHandle> Handles = ASC->GetActiveEffects(
+		FGameplayEffectQuery::MakeQuery_MatchAnyOwningTags(FGameplayTagContainer(LOAGameplayTags::State_Buff_Shield)));
+	for (const FActiveGameplayEffectHandle& Handle : Handles)
+	{
+		const FActiveGameplayEffect* Effect = ASC->GetActiveGameplayEffect(Handle);
+		if (!Effect || !Effect->Spec.Def)
+		{
+			continue;
+		}
+
+		// 이 GE의 Shield Modifier가 지금 얹은 몫 (중첩 수까지 곱한 값)
+		float EffectAmount = 0.f;
+		const TArray<FGameplayModifierInfo>& Modifiers = Effect->Spec.Def->Modifiers;
+		for (int32 Index = 0; Index < Modifiers.Num(); ++Index)
+		{
+			if (Modifiers[Index].Attribute == GetShieldAttribute())
+			{
+				EffectAmount += Effect->Spec.GetModifierMagnitude(Index, true);
+			}
+		}
+		if (EffectAmount <= 0.f)
+		{
+			continue;
+		}
+
+		FShieldEntry& Entry = Entries.AddDefaulted_GetRef();
+		Entry.Handle = Handle;
+		Entry.Giver = Effect->Spec.GetContext().GetInstigator();
+		const float Remaining = Effect->GetTimeRemaining(WorldTime);
+		Entry.TimeRemaining = (Remaining < 0.f) ? TNumericLimits<float>::Max() : Remaining;
+		Entry.Amount = EffectAmount;
+		Entry.Used = Effect->Spec.GetSetByCallerMagnitude(LOAGameplayTags::SetByCaller_ShieldUsed, false, 0.f);
+	}
+
+	// 곧 끝날 것부터 (사용자 결정 2026-11-07: 어차피 사라질 보호막을 먼저 쓴다)
+	Entries.Sort([](const FShieldEntry& A, const FShieldEntry& B) { return A.TimeRemaining < B.TimeRemaining; });
+
+	// 전투 알림판에 "보호막이 막음": 보호막 GE마다 막은 양 + 그 보호막을 건 사람 (2026-11-15 apply115. 듣는 쪽: 레이드 기록)
+	ULOACombatNoticeSubsystem* CombatNotice = ULOACombatNoticeSubsystem::Get(ASC);
+
+	float Left = Amount;
+	for (const FShieldEntry& Entry : Entries)
+	{
+		if (Left <= 0.f)
+		{
+			break;
+		}
+		const float Take = FMath::Min(Entry.Amount, Left);
+		Left -= Take;
+
+		if (CombatNotice)
+		{
+			FLOAShieldAbsorbedInfo Info;
+			Info.ShieldGiver = Entry.Giver.Get();
+			Info.Target = ASC->GetAvatarActor();
+			Info.Amount = Take;
+			CombatNotice->NotifyShieldAbsorbed(Info);
+		}
+
+		if (Take >= Entry.Amount)
+		{
+			// 다 깎임 → 지운다 (태그·아이콘도 같이 사라진다). 몫이 0이 된 GE가 시간 끝까지 남지 않게
+			ASC->RemoveActiveGameplayEffect(Entry.Handle);
+		}
+		else
+		{
+			// 깎인 양을 늘린다 → 엔진이 바로 Modifier를 다시 계산한다 (CalculateModifierMagnitudes, GameplayEffect.cpp)
+			ASC->UpdateActiveGameplayEffectSetByCallerMagnitude(Entry.Handle, LOAGameplayTags::SetByCaller_ShieldUsed, Entry.Used + Take);
+		}
+	}
+
+	return Amount - Left;
 }
 
 // ---------- 복제 도착 알림 ----------
@@ -172,4 +310,9 @@ void ULOAAttributeSet_Common::OnRep_Health(const FGameplayAttributeData& OldValu
 void ULOAAttributeSet_Common::OnRep_MaxHealth(const FGameplayAttributeData& OldValue)
 {
 	GAMEPLAYATTRIBUTE_REPNOTIFY(ULOAAttributeSet_Common, MaxHealth, OldValue);
+}
+
+void ULOAAttributeSet_Common::OnRep_Shield(const FGameplayAttributeData& OldValue)
+{
+	GAMEPLAYATTRIBUTE_REPNOTIFY(ULOAAttributeSet_Common, Shield, OldValue);
 }

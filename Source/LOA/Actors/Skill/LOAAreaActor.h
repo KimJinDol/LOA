@@ -15,8 +15,15 @@
 //        Tick Count       1            판정 횟수 (1 = 한 방)
 //        Tick Interval    0.5          판정 사이 간격 (초). Tick Count 2 이상일 때만 보임
 //        Linger Time      0.5          마지막 판정 뒤 사라지기까지 (초). 연출(낫이 박혀 있는 모습)용
+//        Snap To Ground   ☑            소환되면 이 액터를 발밑 바닥으로 옮김 (겉모습이 공중에 뜨지 않게. 판정·예고 기준점은 Shape의 같은 칸)
 //   4) 예고가 필요하면: Telegraph Style에 겉모습 에셋 (예: DA_Telegraph_BossDanger. 비우면 예고 없음)
 //      예고 모양·크기·자리는 Targeting(Shape)의 판정 모양에서 저절로 정해진다. (판정과 같은 규칙: GetShapeCenter)
+//      Hit Timing (예고가 있을 때만 보임, 2026-10-31):
+//        Telegraph (기본) : 차오르는 예고가 꽉 차는 순간을 보고 피함 → 항상 서버 판정, 예고 앞당김
+//        Animation        : 빨간 구역만 보여 주고 보스 모션을 보고 피함 → Targeting의 Hit Judge대로 (Victim 가능),
+//                           예고는 보스 모션에 맞춰 그린다 (내 화면에서 도끼가 떨어지는 순간 사라짐)
+//      Hit After Fill (예고가 있을 때만 보임, 2026-10-31): 꽉 찬 뒤 판정까지 (초). 0 = 꽉 참이 곧 판정
+//        예) 꽉 차고 0.5초 뒤 터짐 (리듬) → Telegraph + 0.5 / 꽉 차고 보스가 내려찍음 → Animation + 그 시간
 //   ※ 예고가 있는 공격은 전부 이 액터로 만든다. (보스가 그 자리에서 휘두르는 부채꼴도 발밑에 이 액터를 소환)
 //     예고와 판정이 같은 객체·같은 자리·같은 시각이라 어긋날 수 없다. 예고 없는 즉발 공격은 Apply 모듈.
 //   데미지는 여기서 정하지 않는다. → 이 BP를 소환하는 GA의 Spawn 모듈 Payloads (스킬마다 다른 배율)
@@ -30,8 +37,8 @@
 //     → BeginPlay : 첫 판정까지의 초 = 넘겨받은 초, 없으면 First Tick Delay
 //                   Telegraph Style이 있으면: 판정 모양 → 예고 모양으로 옮겨 ULOATelegraphSubsystem::ShowToAll(그 초)
 //                   첫 판정 예약 (0이면 바로 판정)
-//     → DoTick    : ULOAHitJudgeSubsystem::JudgeAndApply(Targeting, Context, Payloads, Timing) → 범위 안 대상 전부에게 Payloads
-//                   Timing: Telegraph Style이 있으면 Telegraph(예고를 보고 피함), 없으면 Animation(보스 모션을 보고 피함)
+//     → DoTick    : ULOACombatJudgeManagerSubsystem::JudgeAndApply(Targeting, Context, Payloads, Timing) → 범위 안 대상 전부에게 Payloads
+//                   Timing: Telegraph Style이 있으면 Hit Timing 칸 (기본 Telegraph), 없으면 Animation (GetHitTiming)
 //                   (판정 방식은 Targeting의 Hit Judge 칸. 이 액터는 모른다. Victim이면 원격 플레이어는 보고를 받은 뒤 적용됨)
 //                   남은 횟수가 있으면 Tick Interval 뒤 다시 DoTick
 //                   다 했으면 Linger Time 뒤 사라짐 (0이면 바로)
@@ -49,12 +56,17 @@
 //   2. 전달    : 액터 자체는 복제(처음 위치·방향, 겉모습). 예고는 이 액터와 따로 간다. (ULOACombatRPCComponent Reliable RPC)
 //   3. 각자    : 예고 그리기 (각 컴퓨터의 ULOATelegraphSubsystem)
 //   움직이지 않으므로 이동 복제는 끈다. 서버가 Destroy하면 클라의 액터도 사라진다.
-//   ※ 예고는 "서버 시각" 기준으로 차오르므로 늦게 받아도 꽉 차는 순간은 같다.
+//   ※ 예고는 "서버 시각 + 내 편도 + 여유"로 차오른다 (ULOATelegraphSubsystem [예고 앞당김]).
+//     내 이동이 편도만큼 늦게 서버에 닿으니, 서버 판정 순간에 서버가 아는 내 위치 = 내 화면에서 꽉 찬 순간의 위치.
+//     그래서 예고가 꽉 차는 순간을 보고 피하는 장판(Hit Timing = Telegraph)은 항상 서버 판정이다 (2026-10-29).
+//     Hit Judge를 Victim으로 두면 저장 시 오류 (IsDataValid).
+//   ※ Hit Timing = Animation이면 예고를 앞당기지 않고 보스 모션에 맞춰 그린다 (ULOATelegraphSubsystem [보스 모션에 맞춰 그리기]. 2026-10-31)
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "Actors/Skill/LOASkillActor.h"
+#include "Combat/LOAHitJudgeTypes.h"   // ELOAHitJudgeTiming (칸 타입)
 #include "LOAAreaActor.generated.h"
 
 class ULOASkillTargeting;
@@ -72,6 +84,7 @@ public:
 	/**
 	 * [에디터 전용] BP 저장 시 검사.
 	 *   오류 : Targeting 없음 / Tick Count 2 이상인데 Tick Interval이 0 이하
+	 *          Hit Timing이 Telegraph(예고가 있음)인데 Targeting(Shape)의 Hit Judge가 Victim (예고가 꽉 차는 장판은 항상 서버 판정)
 	 *   Targeting 칸 검사 : 고른 Targeting 종류의 ValidateTargeting (예: Fan의 Inner Radius)
 	 */
 	virtual EDataValidationResult IsDataValid(class FDataValidationContext& Context) const override;
@@ -101,6 +114,9 @@ private:
 	 * @return 예고 번호. 띄우지 않았으면 0
 	 */
 	int32 ShowTelegraph(float SecondsUntilHit) const;
+
+	/** 플레이어가 무엇을 보고 피하나. 예고가 없으면 보스 모션, 있으면 Hit Timing 칸 */
+	ELOAHitJudgeTiming GetHitTiming() const { return TelegraphStyle ? HitTiming : ELOAHitJudgeTiming::Animation; }
 
 	// ---------- 컴포넌트 ----------
 
@@ -138,12 +154,38 @@ private:
 	float LingerTime = 0.5f;
 
 	/**
+	 * 소환되면 이 액터를 발밑 바닥으로 옮기나 (2026-11-01). 켜짐(기본) = 메시·나이아가라가 바닥에 붙는다 / 꺼짐 = 소환 위치 그대로.
+	 * 서버 BeginPlay에서 한 번 (클라는 옮겨진 처음 위치를 복제로 받는다). 판정·예고 기준점은 Targeting Shape의 Snap To Ground가 따로 정한다.
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "LOA|Area")
+	bool bSnapToGround = true;
+
+	/**
 	 * 예고 겉모습. 고르면 첫 판정 전에 판정 모양 그대로 예고가 깔리고, 첫 판정 순간 꽉 찬다. 비우면 예고 없음.
 	 * 예) 보스 장판 = DA_Telegraph_BossDanger / 플레이어 스킬 낫 = 비움
 	 * 예고 모양은 Targeting이 Shape일 때만 알 수 있다. (다른 종류면 경고 + 예고 없음)
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "LOA|Area")
 	TObjectPtr<ULOATelegraphStyle> TelegraphStyle;
+
+	/**
+	 * 플레이어가 무엇을 보고 피하나 (예고가 있을 때만. 없으면 언제나 보스 모션)
+	 *   Telegraph (기본) : 차오르는 예고가 꽉 차는 순간 → 항상 서버 판정, 예고를 앞당겨 그림
+	 *   Animation        : 빨간 구역만 보여 주고 보스 모션을 보고 피함 → Hit Judge대로 (Victim 가능), 예고는 보스 모션에 맞춰 그림
+	 *                      차오름 층이 없는 Style을 쓴다 (예: 빨강 한 층). 있어도 도끼가 떨어지는 순간 꽉 찬다
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "LOA|Area", meta = (EditCondition = "TelegraphStyle != nullptr", EditConditionHides))
+	ELOAHitJudgeTiming HitTiming = ELOAHitJudgeTiming::Telegraph;
+
+	/**
+	 * 예고가 꽉 찬 뒤 판정까지 (초). 0이면 꽉 참 = 판정 (기본). 예고는 판정까지 꽉 찬 채로 남는다.
+	 *   예) 첫 판정 1.7초 뒤, 0.5 → 1.2초에 꽉 참, 0.5초 꽉 찬 채 → 1.7초에 터짐
+	 *   Hit Timing과 같이: Telegraph = 꽉 찬 뒤 리듬을 보고 피함 (서버 판정, 예고 통째로 앞당김)
+	 *                      Animation = 꽉 찬 뒤 보스 모션을 보고 피함 (Hit Judge대로, 보스 모션에 맞춰 그림)
+	 * 첫 판정까지의 시간보다 크면 처음부터 꽉 찬 채로 깔린다
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "LOA|Area", meta = (ClampMin = "0", Units = "Seconds", EditCondition = "TelegraphStyle != nullptr", EditConditionHides))
+	float HitAfterFill = 0.f;
 
 	// ---------- 런타임 ----------
 

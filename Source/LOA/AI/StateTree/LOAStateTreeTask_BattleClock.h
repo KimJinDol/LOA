@@ -13,7 +13,7 @@
 //     시계를 교전에 두면 패턴 하나 끝날 때마다 0이 된다. 전투는 전멸해서 대기로 갈 때까지 계속 머문다.
 //
 // [흐름]
-//   EnterState : Elapsed = 0, TimeAwayFromCenter = 0 → Running
+//   EnterState : Elapsed = 0, TimeAwayFromCenter = 0, ALOAGameState::StartBattle() (전투 중으로 + 공용 부활 목숨 시계 시작. 전투 전일 때만 받음 → 전멸 뒤 다시 다가가면 다시 시작) → Running
 //   Tick       : Elapsed += 이번 프레임 시간
 //                보스가 중앙 반경(Center Radius, 바닥 거리) 밖이면 TimeAwayFromCenter += 이번 프레임 시간, 안이면 0
 //                예) 반경 1200. 보스가 중앙에서 1500cm에 20초 서 있음 → 20 → 중앙 복귀 → 중앙 도착 → 0

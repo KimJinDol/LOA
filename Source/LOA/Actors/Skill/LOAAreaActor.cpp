@@ -6,7 +6,8 @@
 #include "Library/LOACombatLibrary.h"
 #include "Combat/Telegraph/LOATelegraphSubsystem.h"
 #include "Combat/Telegraph/LOATelegraphTypes.h"
-#include "Combat/LOAHitJudgeSubsystem.h"
+#include "Combat/LOACombatJudgeManagerSubsystem.h"
+#include "AbilitySystem/Effects/LOAGE_CrowdControl.h"
 #include "Core/LOALog.h"
 #include "TimerManager.h"
 
@@ -39,6 +40,16 @@ void ALOAAreaActor::BeginPlay()
 	if (!HasAuthority())
 	{
 		return;
+	}
+
+	// 땅에 붙이기 (겉모습용). 처음 위치는 이 BeginPlay 뒤에 복제되므로 클라도 옮겨진 자리로 받는다
+	if (bSnapToGround)
+	{
+		FVector Ground;
+		if (ULOACombatLibrary::FindGroundLocation(GetWorld(), GetActorLocation(), Ground, this))
+		{
+			SetActorLocation(Ground);
+		}
 	}
 
 	// 설정 누락: 판정할 수 없으니 연출 시간만큼 두었다가 사라진다.
@@ -99,11 +110,13 @@ void ALOAAreaActor::DoTick()
 	// 첫 판정이 났다 → 예고는 판정 시각에 스스로 사라진다. 이제 이 액터가 지워져도 예고를 지울 필요 없음
 	TelegraphId = 0;
 
-	// ①② 범위 안 대상 판정 + Payloads 적용. 판정 방식(서버 / 피해자)은 판정 담당이 Targeting을 보고 정한다.
+	// ①② 범위 안 대상 판정 + Payloads 적용. 판정 방식(서버 / 피해자)은 판정 매니저가 Targeting을 보고 정한다.
 	//    (모양 기준점 = 이 액터 / 편 판단 = 시전자. Context는 InitSkillActor에서 그렇게 바뀌어 있다)
-	//    플레이어가 보고 피하는 것: 예고를 띄우는 장판 = 예고 / 예고 없는 장판(보이지 않는 휘두르기 등) = 보스 모션
-	const ELOAHitJudgeTiming Timing = TelegraphStyle ? ELOAHitJudgeTiming::Telegraph : ELOAHitJudgeTiming::Animation;
-	const int32 NumNow = ULOAHitJudgeSubsystem::JudgeAndApply(Targeting, GetSkillContext(), GetSkillPayloads(), Timing);
+	//    플레이어가 보고 피하는 것: 차오르는 예고 = 예고 / 빨간 구역만 또는 예고 없음 = 보스 모션 (GetHitTiming)
+	ULOACombatJudgeManagerSubsystem* JudgeManager = ULOACombatJudgeManagerSubsystem::Get(this);
+	const int32 NumNow = JudgeManager
+		? JudgeManager->JudgeAndApply(Targeting, GetSkillContext(), GetSkillPayloads(), GetHitTiming())
+		: 0;
 
 	LOA_LOG(this, Log, TEXT("[Area] tick %d/%d : %d target(s) now"), TicksDone, TickCount, NumNow);
 
@@ -149,8 +162,23 @@ int32 ALOAAreaActor::ShowTelegraph(float SecondsUntilHit) const
 	Data.Location = ULOACombatLibrary::GetShapeCenter(this, HitShape);
 	Data.Yaw = GetActorRotation().Yaw;
 
-	// ③ 모든 플레이어 화면으로 (시각과 번호는 입구가 채운다)
-	return ULOATelegraphSubsystem::ShowToAll(this, Data, SecondsUntilHit);
+	// 보스 모션을 보고 피하는 장판이면 예고를 앞당기지 않고 보스 모션에 맞춰 그린다 (ULOATelegraphSubsystem [보스 모션에 맞춰 그리기])
+	Data.bSyncWithBossMotion = (GetHitTiming() == ELOAHitJudgeTiming::Animation);
+
+	// 예고가 꽉 차는 장판이면 클라가 판정 순간 먼저 반응한다 (ULOAServerJudgeSubsystem [클라: 예고 장판이 내 화면에서 다 참])
+	//   공격한 보스 + 공격 속성 → 저가 공격이면 맞은 사람 저가 컴포넌트가 그 보스의 구간으로 먼저 Success (2026-11-04. 전에는 bJustGuardable)
+	//   CC가 있으면 → 먼저 경직·띄움 반응 (2026-11-01)
+	//   보스 모션 장판은 피해자 판정 요청이 같은 것을 따로 싣는다
+	if (GetHitTiming() == ELOAHitJudgeTiming::Telegraph)
+	{
+		const FLOASkillModuleContext& Context = GetSkillContext();
+		Data.Attacker = Context.Caster;
+		Data.AttackTags = Context.AttackTags;
+		Data.CrowdControlEffect = ULOACombatLibrary::FindPayloadEffect(GetSkillPayloads(), ULOAGE_CrowdControl::StaticClass());
+	}
+
+	// ③ 모든 플레이어 화면으로 (시각과 번호는 입구가 채운다). 꽉 찬 뒤 판정까지 = Hit After Fill
+	return ULOATelegraphSubsystem::ShowToAll(this, Data, SecondsUntilHit, HitAfterFill);
 }
 
 // =============================================================================
@@ -174,6 +202,17 @@ EDataValidationResult ALOAAreaActor::IsDataValid(FDataValidationContext& Context
 	{
 		const FString TargetingPrefix = FString::Printf(TEXT("%s Targeting"), *Name);
 		Result = CombineDataValidationResults(Result, Targeting->ValidateTargeting(Context, TargetingPrefix));
+
+		// 예고가 꽉 차는 순간을 보고 피하는 장판은 항상 서버 판정 (예고를 앞당겨 그리므로 화면대로). Victim을 고르면 헷갈리니 막는다.
+		//   빨간 구역만 보여 주는 장판(Hit Timing = Animation)은 Victim 가능
+		const ULOASkillTargeting_Shape* ShapeTargeting = Cast<ULOASkillTargeting_Shape>(Targeting);
+		if (GetHitTiming() == ELOAHitJudgeTiming::Telegraph && ShapeTargeting && ShapeTargeting->GetHitJudge() == ELOAHitJudgeMode::Victim)
+		{
+			Context.AddError(FText::FromString(FString::Printf(
+				TEXT("%s : Hit Timing is Telegraph, so this area is always judged by the server. Set Targeting Hit Judge to Server, or Hit Timing to Animation."),
+				*Name)));
+			Result = EDataValidationResult::Invalid;
+		}
 	}
 
 	if (TickCount > 1 && TickInterval <= 0.f)

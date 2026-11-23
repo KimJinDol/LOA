@@ -2,7 +2,7 @@
 // 에디터 전용 모듈(LOAEditor)이 어떤 엔진 기능(모듈)을 사용할지 알려주는 파일.
 //
 // [이 모듈은 무엇인가]
-// 게임 코드(LOA 모듈)를 돕는 에디터 도구만 둔다. (예: 스킬 만들기 도구 ULOASkillFactory)
+// 게임 코드(LOA 모듈)를 돕는 에디터 도구만 둔다. (예: 스킬 만들기 도구 ULOASkillFactory, 플레이어 테스터 창 ULOAPlayerTesterWidget)
 // LOA.uproject에 "Type": "Editor"로 등록되어 있어서 에디터 빌드에서만 컴파일된다. → 패키징한 게임에는 들어가지 않는다.
 //
 // [방향]
@@ -32,6 +32,11 @@ public class LOAEditor : ModuleRules
 			// 게임 모듈: GA 클래스(ULOAPlayerAbility …), 클래스 데이터(ULOACharacterClassData)
 			// 공개 헤더(LOASkillFactory.h)에 LOA 타입이 나오므로 Public
 			"LOA",
+
+			// 에디터 창(에디터 유틸리티 위젯)의 부모 UEditorUtilityWidget. 공개 헤더(LOAPlayerTesterWidget.h)의 부모라 Public (2026-11-05)
+			"Blutility",
+			// 위젯 부품: 콤보 박스, 스핀 박스, 버튼, 텍스트 (LOAPlayerTesterWidget.h)
+			"UMG",
 		});
 
 		// 내부 구현에서만 쓰는 모듈 (헤더에 노출되지 않으므로 Private)

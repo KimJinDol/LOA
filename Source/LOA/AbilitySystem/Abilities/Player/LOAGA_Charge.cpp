@@ -20,6 +20,14 @@ namespace LOAChargeFreeze
 {
 	/** 블렌드 아웃 시작 시점보다 이만큼 더 앞에서 멈춘다 (초, 몽타주 시간). 프레임이 늦게 와도 블렌드 아웃에 들어가지 않게 */
 	constexpr float SafetyMargin = 0.05f;
+
+	/**
+	 * 멈춤 재생 속도. 0이 아니라 아주 작은 값 (헤더 상단 [몽타주] ②)
+	 * 0이면 엔진이 멈춘 동안의 시간을 쌓아 두었다가 풀 때 한꺼번에 써서 Release가 끝부분만 나온다.
+	 * 0이 아니면 매 프레임 그 프레임 시간을 바로 쓴다 (아주 조금 움직임) → 쌓이지 않음
+	 * 움직이는 양: 1초 멈춤 = 몽타주 0.001초. SafetyMargin(0.05)을 다 쓰려면 50초 → 최대 차지 시간보다 훨씬 김
+	 */
+	constexpr float FrozenPlayRate = 0.001f;
 }
 
 ULOAGA_Charge::ULOAGA_Charge(const FObjectInitializer& ObjectInitializer)
@@ -38,6 +46,8 @@ void ULOAGA_Charge::StartSkill()
 	ChargeMultiplier = 1.f;
 	bMontageFrozen = false;
 	FreezeTask = nullptr;
+	bChargeStarted = false;
+	bChargeReleased = false;
 
 	// ① 몽타주 재생. 끝나면(Release 섹션까지 다 돌면) 부모가 종료한다.
 	if (!PlayMontageAndEnd())
@@ -60,11 +70,45 @@ void ULOAGA_Charge::StartSkill()
 	ULOAAbilityTask_WaitChargeRelease* WaitTask = ULOAAbilityTask_WaitChargeRelease::WaitChargeRelease(this, MaxChargeTime);
 	WaitTask->OnReleased.AddDynamic(this, &ThisClass::OnChargeReleased);
 	WaitTask->ReadyForActivation();
+
+	// ③ 차지 게이지 보이기 (조종하는 사람 컴퓨터만. 헤더 [차지 게이지 UI])
+	bChargeStarted = true;
+	SendChargeUIEvent(LOAGameplayTags::Event_Skill_Charge_Started);
+}
+
+void ULOAGA_Charge::EndAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+	const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled)
+{
+	// 차지를 시작했는데 떼기 전에 끝남 (회피·CC로 끊김) → 차지 게이지 숨기기
+	if (IsEndAbilityValid(Handle, ActorInfo) && bChargeStarted && !bChargeReleased)
+	{
+		SendChargeUIEvent(LOAGameplayTags::Event_Skill_Charge_Cancelled);
+	}
+	bChargeStarted = false;
+
+	Super::EndAbility(Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled);
+}
+
+void ULOAGA_Charge::SendChargeUIEvent(const FGameplayTag& EventTag) const
+{
+	const FGameplayAbilityActorInfo* ActorInfo = GetCurrentActorInfo();
+	UAbilitySystemComponent* ASC = GetAbilitySystemComponentFromActorInfo();
+	if (!ASC || !ActorInfo || !ActorInfo->IsLocallyControlled())
+	{
+		return;	// UI는 조종하는 사람 컴퓨터에만 있다
+	}
+
+	FGameplayEventData Payload;
+	Payload.EventTag = EventTag;
+	Payload.Instigator = GetAvatarActorFromActorInfo();
+	Payload.OptionalObject = this;
+	ASC->HandleGameplayEvent(Payload.EventTag, &Payload);
 }
 
 void ULOAGA_Charge::OnChargeReleased(float HeldTime, bool bServerTimedOut)
 {
 	// ① 배율 확정. 이후 모듈이 만드는 Context에 이 값이 들어간다.
+	bChargeReleased = true;
 	bool bPerfect = false;
 	ChargeMultiplier = CalculateChargeMultiplier(HeldTime, bPerfect);
 
@@ -78,6 +122,7 @@ void ULOAGA_Charge::OnChargeReleased(float HeldTime, bool bServerTimedOut)
 		FGameplayEventData Payload;
 		Payload.Instigator = GetAvatarActorFromActorInfo();
 		Payload.EventMagnitude = HeldTime;
+		Payload.OptionalObject = this;	// 차지 게이지 UI가 도달 단계를 물어본다 (GetReachedStageCount)
 
 		Payload.EventTag = LOAGameplayTags::Event_Skill_Charge_Released;
 		ASC->HandleGameplayEvent(Payload.EventTag, &Payload);
@@ -127,19 +172,20 @@ void ULOAGA_Charge::OnChargeReleased(float HeldTime, bool bServerTimedOut)
 
 float ULOAGA_Charge::GetChargeFreezeDelay() const
 {
-	if (!Montage)
+	const UAnimMontage* MontageToPlay = GetMontage();
+	if (!MontageToPlay)
 	{
 		return 0.f;
 	}
 
 	// 첫 섹션 = 몽타주 0초 위치의 섹션 (PlayMontageAndEnd는 처음부터 재생한다)
-	const int32 FirstIndex = Montage->GetSectionIndexFromPosition(0.f);
-	const float SectionLength = Montage->GetSectionLength(FirstIndex);
+	const int32 FirstIndex = MontageToPlay->GetSectionIndexFromPosition(0.f);
+	const float SectionLength = MontageToPlay->GetSectionLength(FirstIndex);
 
 	// 블렌드 아웃 시작 = 끝에서 BlendOutTriggerTime 전 (음수면 블렌드 아웃 시간을 쓴다)
-	const float BlendOutTrigger = Montage->BlendOutTriggerTime >= 0.f
-		? Montage->BlendOutTriggerTime
-		: Montage->GetDefaultBlendOutTime();
+	const float BlendOutTrigger = MontageToPlay->BlendOutTriggerTime >= 0.f
+		? MontageToPlay->BlendOutTriggerTime
+		: MontageToPlay->GetDefaultBlendOutTime();
 
 	// 몽타주 시간 → 실제 시간 (재생 속도로 나눔)
 	const float FreezePosition = FMath::Max(SectionLength - BlendOutTrigger - LOAChargeFreeze::SafetyMargin, 0.f);
@@ -150,10 +196,10 @@ void ULOAGA_Charge::OnChargeFreeze()
 {
 	FreezeTask = nullptr;
 
-	// 재생 속도 0 = 그 자세로 멈춤. ASC를 통해서 바꾸므로 다른 플레이어 화면에도 복제된다.
+	// 재생 속도 거의 0 = 그 자세로 멈춤 (정확히 0은 안 됨: FrozenPlayRate 설명). ASC를 통해서 바꾸므로 다른 플레이어 화면에도 복제된다.
 	if (UAbilitySystemComponent* ASC = GetAbilitySystemComponentFromActorInfo())
 	{
-		ASC->CurrentMontageSetPlayRate(0.f);
+		ASC->CurrentMontageSetPlayRate(LOAChargeFreeze::FrozenPlayRate);
 		bMontageFrozen = true;
 	}
 }
@@ -338,3 +384,35 @@ EDataValidationResult ULOAGA_Charge::IsDataValid(FDataValidationContext& Context
 	return Result;
 }
 #endif
+
+// =============================================================================
+// 차지 게이지 UI (헤더 [차지 게이지 UI])
+// =============================================================================
+
+FLOAChargeGaugeInfo ULOAGA_Charge::MakeChargeGaugeInfo() const
+{
+	FLOAChargeGaugeInfo Info;
+	Info.MaxChargeTime = MaxChargeTime;
+	for (const FLOAChargeStage& Stage : Stages)
+	{
+		Info.StageTimes.Add(Stage.Time);
+	}
+	Info.StageTimes.Sort();	// 저장 시 검사가 순서를 보지만, 게이지 계산은 오름차순을 가정하므로 한 번 더
+	Info.bUsePerfectZone = bUsePerfectZone;
+	Info.PerfectZoneStart = PerfectZoneStart;
+	Info.PerfectZoneEnd = PerfectZoneEnd;
+	return Info;
+}
+
+int32 ULOAGA_Charge::GetReachedStageCount(float HeldTime) const
+{
+	int32 Count = 0;
+	for (const FLOAChargeStage& Stage : Stages)
+	{
+		if (HeldTime >= Stage.Time)
+		{
+			++Count;
+		}
+	}
+	return Count;
+}

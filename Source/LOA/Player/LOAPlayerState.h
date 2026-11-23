@@ -26,7 +26,7 @@
 class UAbilitySystemComponent;
 class ULOAAbilitySystemComponent;
 class ULOAAttributeSet_Common;
-class ULOAAttributeSet_Mana;
+class ULOAAttributeSet_Player;
 class ULOAAttributeSet_Combat;
 class ULOACharacterClassData;
 
@@ -51,9 +51,9 @@ public:
 	UFUNCTION(BlueprintPure, Category = "LOA|PlayerState")
 	const ULOAAttributeSet_Common* GetCommonAttributeSet() const { return CommonAttributeSet; }
 
-	/** 마나 스탯창 (마나, 최대 마나, 마나 회복량). 플레이어만 가진다. */
+	/** 플레이어 스탯창 (마나, 최대 마나, 마나 회복량, 낙인력). 플레이어만 가진다. (2026-11-07: 옛 GetManaAttributeSet) */
 	UFUNCTION(BlueprintPure, Category = "LOA|PlayerState")
-	const ULOAAttributeSet_Mana* GetManaAttributeSet() const { return ManaAttributeSet; }
+	const ULOAAttributeSet_Player* GetPlayerAttributeSet() const { return PlayerAttributeSet; }
 
 	/** 전투 스탯창 (공격력) */
 	UFUNCTION(BlueprintPure, Category = "LOA|PlayerState")
@@ -88,9 +88,9 @@ private:
 	UPROPERTY()
 	TObjectPtr<ULOAAttributeSet_Common> CommonAttributeSet;
 
-	/** 마나 스탯창. 모든 직업이 마나로 스킬을 쓰므로 여기서 기본으로 만든다. (보스는 없음 → Common과 분리) */
+	/** 플레이어 스탯창 (마나, 낙인력). 모든 직업이 가지므로 여기서 기본으로 만든다. (보스는 없음 → Common과 분리) */
 	UPROPERTY()
-	TObjectPtr<ULOAAttributeSet_Mana> ManaAttributeSet;
+	TObjectPtr<ULOAAttributeSet_Player> PlayerAttributeSet;
 
 	/** 전투 스탯창. 모든 직업이 공격하므로 Common과 같이 여기서 기본으로 만든다. */
 	UPROPERTY()

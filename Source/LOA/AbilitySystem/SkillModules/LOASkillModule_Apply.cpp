@@ -3,8 +3,11 @@
 #include "AbilitySystem/SkillModules/LOASkillModule_Apply.h"
 #include "AbilitySystem/Abilities/LOAGameplayAbility.h"
 #include "AbilitySystem/SkillModules/Targeting/LOASkillTargeting.h"
-#include "Combat/LOAHitJudgeSubsystem.h"
+#include "Animation/LOAAnimNotify_SendGameplayEvent.h"
+#include "Combat/LOACombatJudgeManagerSubsystem.h"
 #include "Core/LOALog.h"
+
+#include "Animation/AnimMontage.h"
 
 #if WITH_EDITOR
 #include "Misc/DataValidation.h"
@@ -31,40 +34,68 @@ void ULOASkillModule_Apply::SkillModuleInit()
 		LOA_LOG(Owner->GetAvatarActorFromActorInfo(), Warning,
 			TEXT("[%s] Apply module: Payloads is empty."), *GetNameSafe(Owner->GetClass()));
 	}
+
+	// 판정 매니저에 스킬 시작을 알린다 (원격 플레이어의 공격자 판정 공격이면 서버가 이 발동의 보고를 듣기 시작. 아니면 아무것도 안 함)
+	if (ULOACombatJudgeManagerSubsystem* JudgeManager = ULOACombatJudgeManagerSubsystem::Get(Owner->GetAvatarActorFromActorInfo()))
+	{
+		JudgeManager->BeginAttackReports(Owner, this, Targeting, Payloads, CountAllowedReports());
+	}
 }
 
 void ULOASkillModule_Apply::SkillModuleTriggered(const FGameplayEventData* EventData)
 {
-	// 조종하는 사람 컴퓨터와 서버에서 각각 호출된다. 판정은 ApplyToTargets 안에서 서버만 한다.
-	ApplyToTargets();
+	// 조종하는 사람 컴퓨터와 서버에서 각각 호출된다. 이 컴퓨터가 할 일(서버 판정 / 보고 / 기다림)은 판정 매니저가 정한다
+	ULOAGameplayAbility* Owner = GetOwnerAbility();
+	if (!Owner)
+	{
+		return;
+	}
+	if (ULOACombatJudgeManagerSubsystem* JudgeManager = ULOACombatJudgeManagerSubsystem::Get(Owner->GetAvatarActorFromActorInfo()))
+	{
+		JudgeManager->JudgeInstantHit(Owner, this, Targeting, Payloads);
+	}
 }
 
-void ULOASkillModule_Apply::ApplyToTargets()
+void ULOASkillModule_Apply::SkillModuleEnd(bool bWasCancelled)
 {
-	// 결과가 남는 일은 서버만. (조종하는 사람 컴퓨터: 나중에 Cue 모듈이 이펙트만 예측 재생)
-	if (!HasSkillModuleAuthority())
-	{
-		return;
-	}
-
+	// 스킬이 끝나면 늦게 온 보고는 받지 않는다 (예: 서버에서 CC를 먼저 맞아 끊김 → 그 뒤 보고는 데미지 없음)
 	ULOAGameplayAbility* Owner = GetOwnerAbility();
-	if (!Owner || !Targeting || Payloads.IsEmpty())
+	if (!Owner)
 	{
 		return;
 	}
-
-	// ① 누가, 몇 레벨로
-	const FLOASkillModuleContext Context = Owner->MakeSkillModuleContext();
-	if (!Context.IsValid())
+	if (ULOACombatJudgeManagerSubsystem* JudgeManager = ULOACombatJudgeManagerSubsystem::Get(Owner->GetAvatarActorFromActorInfo()))
 	{
-		return;
+		JudgeManager->EndAttackReports(Owner, this);
+	}
+}
+
+int32 ULOASkillModule_Apply::CountAllowedReports() const
+{
+	// On Skill Start = 한 번
+	if (Trigger == ELOASkillModuleTrigger::OnSkillStart)
+	{
+		return 1;
 	}
 
-	// ②③ 누구에게 + 무엇을. 판정 방식(서버 / 피해자)은 판정 담당이 Targeting을 보고 정한다.
-	//    Apply는 예고가 없다 → 플레이어는 시전자의 모션을 보고 피한다.
-	const int32 NumNow = ULOAHitJudgeSubsystem::JudgeAndApply(Targeting, Context, Payloads, ELOAHitJudgeTiming::Animation);
+	// 몽타주 노티파이 이벤트면 그 노티파이 수 (콤보는 모든 섹션의 노티파이를 합친 수)
+	const ULOAGameplayAbility* Owner = GetOwnerAbility();
+	const UAnimMontage* Montage = Owner ? Owner->GetMontage() : nullptr;
+	int32 NumNotifies = 0;
+	if (Montage)
+	{
+		for (const FAnimNotifyEvent& NotifyEvent : Montage->Notifies)
+		{
+			const ULOAAnimNotify_SendGameplayEvent* SendEvent = Cast<ULOAAnimNotify_SendGameplayEvent>(NotifyEvent.Notify);
+			if (SendEvent && SendEvent->GetEventTag() == TriggerEventTag)
+			{
+				++NumNotifies;
+			}
+		}
+	}
 
-	LOA_LOG(Context.SourceActor.Get(), Log, TEXT("[Apply] %s : %d target(s) now"), *GetNameSafe(Owner->GetClass()), NumNow);
+	// GA가 코드로 보내는 이벤트(Event.Skill.*)처럼 몽타주에 없으면 한 번 (대신 정함 2026-11-02)
+	return FMath::Max(NumNotifies, 1);
 }
 
 // =============================================================================

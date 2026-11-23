@@ -6,6 +6,7 @@
 //
 // 이 모듈의 도구:
 //   ULOASkillFactory (SkillFactory/LOASkillFactory.h) : "스킬 만들기" - 폴더 + GA BP + 몽타주를 한 번에
+//   ULOAPlayerTesterWidget (PlayerTester/LOAPlayerTesterWidget.h) : 플레이어 테스터 에디터 창 - PIE의 플레이어 모두를 한 창에서 (자동 저가 …)
 
 #include "Modules/ModuleManager.h"
 

@@ -153,7 +153,7 @@ void ALOATelegraph::ShowTelegraph(const FLOATelegraphData& Data)
 		LayerMID->SetScalarParameterValue(LOATelegraph::Param_InnerRatio, InnerRatio);
 		LayerMID->SetScalarParameterValue(LOATelegraph::Param_Angle, AngleDegrees);
 		LayerMID->SetScalarParameterValue(LOATelegraph::Param_StartTime, static_cast<float>(Data.StartServerTime));
-		LayerMID->SetScalarParameterValue(LOATelegraph::Param_HitTime, static_cast<float>(Data.HitServerTime));
+		LayerMID->SetScalarParameterValue(LOATelegraph::Param_HitTime, static_cast<float>(Data.FillServerTime));	// 머티리얼의 HitTime = 꽉 차는 시각 (판정은 같거나 뒤)
 	}
 
 	SetTelegraphVisible(true);

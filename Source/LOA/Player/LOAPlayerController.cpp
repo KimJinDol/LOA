@@ -10,6 +10,10 @@
 #include "UI/LOAHUD.h"
 #include "Core/LOALog.h"
 #include "Debug/LOACheatManager.h"
+#include "Player/LOASpectateComponent.h"
+#include "Game/LOAGameState.h"
+#include "Game/LOARaidSubsystem.h"
+#include "Actors/LOABrawlArena.h"
 
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
@@ -17,6 +21,7 @@
 #include "InputAction.h"
 #include "Engine/LocalPlayer.h"
 #include "GameFramework/HUD.h"
+#include "Camera/PlayerCameraManager.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(LOAPlayerController)
 
@@ -33,6 +38,9 @@ ALOAPlayerController::ALOAPlayerController(const FObjectInitializer& ObjectIniti
 
 	// 전투 RPC 컴포넌트. 서버의 PC와 본인 컴퓨터의 PC에 모두 있어야 RPC가 오간다. (복제는 컴포넌트가 직접 켬)
 	CombatRPCComponent = CreateDefaultSubobject<ULOACombatRPCComponent>(TEXT("CombatRPCComponent"));
+
+	// 관전 부품. 클릭 이동처럼 모든 PlayerController에 붙지만 본인 컴퓨터에서만 켠다 (SetupInputComponent)
+	SpectateComponent = CreateDefaultSubobject<ULOASpectateComponent>(TEXT("SpectateComponent"));
 
 	// 치트 매니저 (개발 빌드의 디버그 명령). 창 위젯을 지정하려면 BP에서 Cheat Class를 B_LOACheatManager로 바꾼다.
 	CheatClass = ULOACheatManager::StaticClass();
@@ -60,6 +68,18 @@ void ALOAPlayerController::ServerCheat_Implementation(const FString& Command)
 #endif
 }
 
+void ALOAPlayerController::ClientCheat_Implementation(const FString& Command)
+{
+#if UE_WITH_CHEAT_MANAGER
+	// 이 컴퓨터의 이 PC 치트 매니저(와 그 확장)로 실행
+	if (CheatManager)
+	{
+		LOA_LOG(this, Display, TEXT("[Cheat] %s from server: %s"), *GetNameSafe(this), *Command);
+		ConsoleCommand(Command);
+	}
+#endif
+}
+
 void ALOAPlayerController::BeginPlay()
 {
 	Super::BeginPlay();
@@ -72,6 +92,49 @@ void ALOAPlayerController::BeginPlay()
 		InputMode.SetHideCursorDuringCapture(false);
 		InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
 		SetInputMode(InputMode);
+	}
+}
+
+void ALOAPlayerController::PlayerTick(float DeltaTime)
+{
+	Super::PlayerTick(DeltaTime);
+
+	UpdateTransferFade();
+}
+
+void ALOAPlayerController::UpdateTransferFade()
+{
+	if (!IsLocalController() || !PlayerCameraManager)
+	{
+		return;
+	}
+
+	const ALOAGameState* LOAGameState = GetWorld() ? GetWorld()->GetGameState<ALOAGameState>() : nullptr;
+	float Alpha = LOAGameState ? LOAGameState->GetTransferFadeAlpha() : 0.f;
+
+	// 대난투 차원 이동 (2026-11-18 apply122): 어둡기는 큰 쪽, 줌인은 내 캐릭터 카메라
+	const ULOARaidSubsystem* Raid = ULOARaidSubsystem::Get(this);
+	if (const ALOABrawlArena* Arena = Raid ? Raid->GetBrawlArena() : nullptr)
+	{
+		Alpha = FMath::Max(Alpha, Arena->GetFadeAlpha());
+
+		if (ALOACharacter* MyCharacter = GetPawn<ALOACharacter>())
+		{
+			MyCharacter->SetCameraZoomScale(Arena->GetCameraZoomScale());
+		}
+	}
+
+	if (Alpha > 0.f)
+	{
+		// 서버 시각으로 계산한 값을 그대로 칠한다 (엔진의 자동 애니메이션은 쓰지 않음)
+		PlayerCameraManager->SetManualCameraFade(Alpha, FLinearColor::Black, /*bFadeAudio*/ false);
+		bTransferFadeActive = true;
+	}
+	else if (bTransferFadeActive)
+	{
+		// 끄면 엔진이 화면에 칠하지 않는다 (ULocalPlayer::CalcSceneView가 bEnableFading일 때만 칠함, 엔진 코드 확인)
+		PlayerCameraManager->StopCameraFade();
+		bTransferFadeActive = false;
 	}
 }
 
@@ -129,6 +192,44 @@ void ALOAPlayerController::SetupInputComponent()
 	{
 		ClickMoveComponent->ActivateClickMove(EnhancedInput, InputConfig);
 	}
+
+	// ---------- 3) 관전 입력 (← / →) ----------
+	if (SpectateComponent)
+	{
+		SpectateComponent->ActivateSpectate(EnhancedInput);
+	}
+}
+
+// =============================================================================
+// 부활
+// =============================================================================
+
+void ALOAPlayerController::RequestRevive()
+{
+	// 리슨 호스트 본인이면 RPC가 그냥 함수 호출이 된다.
+	ServerRequestRevive();
+}
+
+void ALOAPlayerController::ServerRequestRevive_Implementation()
+{
+	// ① 내 캐릭터가 죽어 있나 (살아 있는데 목숨을 쓰면 안 됨)
+	ALOACharacter* MyCharacter = GetPawn<ALOACharacter>();
+	if (!MyCharacter || !MyCharacter->IsDead())
+	{
+		LOA_LOG(this, Verbose, TEXT("[Revive] Request ignored: not dead."));
+		return;
+	}
+
+	// ② 공용 목숨을 하나 쓸 수 있나 (없으면 끝. 버튼은 위젯이 꺼 두지만 서버가 한 번 더 막는다)
+	ALOAGameState* LOAGameState = GetWorld() ? GetWorld()->GetGameState<ALOAGameState>() : nullptr;
+	if (!LOAGameState || !LOAGameState->TryConsumeReviveLife())
+	{
+		LOA_LOG(this, Log, TEXT("[Revive] Request denied: no revive life."));
+		return;
+	}
+
+	// ③ 부활 (죽은 자리, 체력 가득, 무적)
+	MyCharacter->ReviveFromDeath();
 }
 
 // =============================================================================

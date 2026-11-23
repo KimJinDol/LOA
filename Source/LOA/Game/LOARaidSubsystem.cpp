@@ -4,10 +4,16 @@
 #include "Character/Monster/Boss/LOABossCharacter.h"
 #include "Character/LOADeathReactionComponent.h"
 #include "Actors/LOALocationMarker.h"
+#include "Actors/LOATerrainZone.h"
+#include "Actors/LOABrawlArena.h"
+#include "Character/Player/LOACharacter.h"
 #include "Core/LOALog.h"
 
 #include "Engine/World.h"
 #include "Engine/Engine.h"
+#include "GameFramework/GameStateBase.h"
+#include "GameFramework/PlayerState.h"
+#include "GameFramework/CharacterMovementComponent.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(LOARaidSubsystem)
 
@@ -113,6 +119,18 @@ bool ULOARaidSubsystem::FindLocation(const FGameplayTag& LocationTag, FVector& O
 	return true;
 }
 
+bool ULOARaidSubsystem::FindLocationTransform(const FGameplayTag& LocationTag, FTransform& OutTransform) const
+{
+	const TWeakObjectPtr<ALOALocationMarker>* Found = Locations.Find(LocationTag);
+	if (!Found || !Found->IsValid())
+	{
+		return false;
+	}
+
+	OutTransform = Found->Get()->GetActorTransform();
+	return true;
+}
+
 void ULOARaidSubsystem::UnregisterBoss(ALOABossCharacter* Boss)
 {
 	// 다른 보스로 이미 바뀌었으면(교체 후 예전 보스가 사라지는 경우) 지금 보스를 건드리지 않는다.
@@ -157,4 +175,191 @@ void ULOARaidSubsystem::MarkCurrentBossDefeated()
 	LOA_LOG(Boss, Log, TEXT("[Raid] Boss defeated: %s"), *GetNameSafe(Boss));
 
 	OnBossDefeated.Broadcast(Boss);
+}
+
+// =============================================================================
+// 지형 구역 (헤더 [지형 구역])
+// =============================================================================
+
+void ULOARaidSubsystem::RegisterBrawlArena(ALOABrawlArena* Arena)
+{
+	if (!Arena)
+	{
+		return;
+	}
+
+	if (BrawlArena.IsValid() && BrawlArena.Get() != Arena)
+	{
+		LOA_LOG(Arena, Warning, TEXT("[Brawl] Another brawl arena (%s) is already registered. Replacing it."), *GetNameSafe(BrawlArena.Get()));
+	}
+	BrawlArena = Arena;
+	OnBrawlArenaChanged.Broadcast(Arena);
+}
+
+void ULOARaidSubsystem::UnregisterBrawlArena(ALOABrawlArena* Arena)
+{
+	if (BrawlArena.Get() == Arena)
+	{
+		BrawlArena.Reset();
+		OnBrawlArenaChanged.Broadcast(nullptr);
+	}
+}
+
+void ULOARaidSubsystem::RegisterTerrainZone(ALOATerrainZone* Zone)
+{
+	if (!Zone || TerrainZones.Contains(Zone))
+	{
+		return;
+	}
+
+	TerrainZones.Add(Zone);
+
+	// 무너졌다는 알림은 서버에서만 울린다 (구역은 누가 듣는지 모른다)
+	Zone->OnCollapsed.AddUObject(this, &ThisClass::HandleTerrainZoneCollapsed);
+
+	LOA_LOG(Zone, Log, TEXT("[Terrain] %s (%s) registered."), *GetNameSafe(Zone), *UEnum::GetValueAsString(Zone->GetSide()));
+}
+
+void ULOARaidSubsystem::UnregisterTerrainZone(ALOATerrainZone* Zone)
+{
+	if (!Zone)
+	{
+		return;
+	}
+
+	Zone->OnCollapsed.RemoveAll(this);
+	TerrainZones.Remove(Zone);
+}
+
+bool ULOARaidSubsystem::RequestTerrainCollapse()
+{
+	const UWorld* World = GetWorld();
+	if (!World || World->GetNetMode() == NM_Client)
+	{
+		return false;
+	}
+
+	// 아직 멀쩡한 구역 중 무작위 하나 (예: 왼·오 둘 다 멀쩡 → 둘 중 하나, 하나 남음 → 그것)
+	TArray<ALOATerrainZone*> Candidates;
+	for (const TWeakObjectPtr<ALOATerrainZone>& Zone : TerrainZones)
+	{
+		if (Zone.IsValid() && Zone->GetZoneState() == ELOATerrainZoneState::Intact)
+		{
+			Candidates.Add(Zone.Get());
+		}
+	}
+
+	if (Candidates.IsEmpty())
+	{
+		LOA_LOG(World, Log, TEXT("[Terrain] Collapse requested, but no intact zone is left (%d zone(s))."), TerrainZones.Num());
+		return false;
+	}
+
+	ALOATerrainZone* Picked = Candidates[FMath::RandRange(0, Candidates.Num() - 1)];
+	LOA_LOG(Picked, Log, TEXT("[Terrain] Collapse requested: picked %s (%d intact zone(s))."),
+		*UEnum::GetValueAsString(Picked->GetSide()), Candidates.Num());
+	return Picked->StartCollapse();
+}
+
+bool ULOARaidSubsystem::RequestTerrainCollapse(ELOATerrainSide Side)
+{
+	const UWorld* World = GetWorld();
+	if (!World || World->GetNetMode() == NM_Client)
+	{
+		return false;
+	}
+
+	for (const TWeakObjectPtr<ALOATerrainZone>& Zone : TerrainZones)
+	{
+		if (Zone.IsValid() && Zone->GetSide() == Side)
+		{
+			return Zone->StartCollapse();	// 이미 예고·무너짐이면 false
+		}
+	}
+
+	LOA_LOG(World, Warning, TEXT("[Terrain] No zone on side %s."), *UEnum::GetValueAsString(Side));
+	return false;
+}
+
+void ULOARaidSubsystem::ResetTerrain()
+{
+	const UWorld* World = GetWorld();
+	if (!World || World->GetNetMode() == NM_Client)
+	{
+		return;
+	}
+
+	for (const TWeakObjectPtr<ALOATerrainZone>& Zone : TerrainZones)
+	{
+		if (Zone.IsValid())
+		{
+			Zone->ResetZone();	// 이미 멀쩡하면 아무것도 안 함
+		}
+	}
+}
+
+int32 ULOARaidSubsystem::GetCollapsedTerrainCount() const
+{
+	int32 Count = 0;
+	for (const TWeakObjectPtr<ALOATerrainZone>& Zone : TerrainZones)
+	{
+		if (Zone.IsValid() && Zone->GetZoneState() != ELOATerrainZoneState::Intact)
+		{
+			++Count;
+		}
+	}
+	return Count;
+}
+
+bool ULOARaidSubsystem::FindRecoverLocation(const FVector& Location, FVector& OutLocation) const
+{
+	// 무너진 구역만 본다. 예고 중인 구역은 아직 바닥이 있다
+	for (const TWeakObjectPtr<ALOATerrainZone>& Zone : TerrainZones)
+	{
+		if (Zone.IsValid() && Zone->GetZoneState() == ELOATerrainZoneState::Collapsed && Zone->IsInside(Location))
+		{
+			OutLocation = Zone->GetRecoverLocation(Location);
+			return true;
+		}
+	}
+	return false;
+}
+
+void ULOARaidSubsystem::HandleTerrainZoneCollapsed(ALOATerrainZone* Zone)
+{
+	UWorld* World = GetWorld();
+	if (!Zone || !World || World->GetNetMode() == NM_Client)
+	{
+		return;
+	}
+
+	// ① 시체: 이동이 꺼져 있어 허공에 남는다 → 가운데 원으로 (살아 있는 사람은 그대로 떨어져 낙사 → FellOutOfWorld가 옮김)
+	if (const AGameStateBase* GameState = World->GetGameState())
+	{
+		for (const APlayerState* PlayerState : GameState->PlayerArray)
+		{
+			ALOACharacter* Character = PlayerState ? Cast<ALOACharacter>(PlayerState->GetPawn()) : nullptr;
+			if (Character && Character->IsDead() && Zone->IsInside(Character->GetActorLocation()))
+			{
+				const FVector Recover = Zone->GetRecoverLocation(Character->GetActorLocation());
+				LOA_LOG(Character, Log, TEXT("[Terrain] Dead body moved out of %s to %s."), *GetNameSafe(Zone), *Recover.ToCompactString());
+				Character->RelocateBody(Recover);
+			}
+		}
+	}
+
+	// ② 보스: 떨어지면 엔진이 지운다 → 가운데 원으로 (StateTree가 지형 파괴 전에 중앙으로 보내지 않으므로 예고 중에 들어와 있을 수 있음)
+	if (ALOABossCharacter* Boss = CurrentBoss.Get())
+	{
+		if (Zone->IsInside(Boss->GetActorLocation()))
+		{
+			const FVector Recover = Zone->GetRecoverLocation(Boss->GetActorLocation());
+			LOA_LOG(Boss, Log, TEXT("[Terrain] Boss moved out of %s to %s."), *GetNameSafe(Zone), *Recover.ToCompactString());
+			if (UCharacterMovementComponent* Movement = Boss->GetCharacterMovement())
+			{
+				Movement->StopMovementImmediately();
+			}
+			Boss->SetActorLocation(Recover, false, nullptr, ETeleportType::TeleportPhysics);
+		}
+	}
 }

@@ -47,6 +47,7 @@ class UStaticMeshComponent;
 class ULOABodyBlockerComponent;
 class ULOAAbilitySystemComponent;
 class ULOAAttributeSet_Common;
+class ULOAAttributeSet_Combat;
 class ULOAMonsterAbilityDataSet;
 struct FOnAttributeChangeData;
 
@@ -95,6 +96,14 @@ private:
 	/** 체력 칸. 플레이어와 같은 AttributeSet을 쓴다. (ASC가 초기화될 때 자동 등록) */
 	UPROPERTY()
 	TObjectPtr<ULOAAttributeSet_Common> CommonAttributeSet;
+
+	/**
+	 * 전투 스탯창 (2026-11-13). 허수아비는 공격하지 않지만, Combat에는 맞는 쪽 칸(치명타 저항, 낙인 받는 피해 증가)도 있다.
+	 * 데미지 계산이 맞는 쪽의 낙인 칸을 캡처하는데, 맞는 쪽에 없는 스탯창 칸을 캡처하면 엔진이 멈춘다 → 허수아비도 가진다.
+	 * 초기값 없음 (전부 0). 낙인·약점 노출 테스트도 허수아비로 할 수 있다
+	 */
+	UPROPERTY()
+	TObjectPtr<ULOAAttributeSet_Combat> CombatAttributeSet;
 
 	// ---------- 데이터 (BP 기본값 또는 레벨 배치 인스턴스에서 지정) ----------
 

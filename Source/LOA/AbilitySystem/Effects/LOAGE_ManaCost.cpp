@@ -1,7 +1,7 @@
 // LOAGE_ManaCost.cpp
 
 #include "AbilitySystem/Effects/LOAGE_ManaCost.h"
-#include "AbilitySystem/Attributes/LOAAttributeSet_Mana.h"
+#include "AbilitySystem/Attributes/LOAAttributeSet_Player.h"
 #include "Core/LOAGameplayTags.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(LOAGE_ManaCost)
@@ -17,7 +17,7 @@ ULOAGE_ManaCost::ULOAGE_ManaCost()
 	ManaCostValue.DataTag = LOAGameplayTags::SetByCaller_ManaCost;
 
 	FGameplayModifierInfo ManaModifier;
-	ManaModifier.Attribute = ULOAAttributeSet_Mana::GetManaAttribute();
+	ManaModifier.Attribute = ULOAAttributeSet_Player::GetManaAttribute();
 	ManaModifier.ModifierOp = EGameplayModOp::Additive;
 	ManaModifier.ModifierMagnitude = FGameplayEffectModifierMagnitude(ManaCostValue);
 

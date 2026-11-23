@@ -2,9 +2,11 @@
 
 #include "AI/StateTree/LOAStateTreeTask_BattleClock.h"
 #include "Game/LOARaidSubsystem.h"
+#include "Game/LOAGameState.h"
 #include "Core/LOALog.h"
 
 #include "StateTreeExecutionContext.h"
+#include "Engine/World.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(LOAStateTreeTask_BattleClock)
 
@@ -16,6 +18,17 @@ EStateTreeRunStatus FLOAStateTreeTask_BattleClock::EnterState(FStateTreeExecutio
 	InstanceData.bWarnedNoCenter = false;
 
 	LOA_LOG(InstanceData.Actor, Log, TEXT("[AI] Battle clock started."));
+
+	// 전투 시작을 레이드 상태에 알린다 → 전투 중 + 공용 부활 목숨 시계 시작 (전투 전일 때만 받음)
+	const UWorld* World = Context.GetWorld();
+	if (ALOAGameState* GameState = World ? World->GetGameState<ALOAGameState>() : nullptr)
+	{
+		GameState->StartBattle();
+	}
+	else
+	{
+		LOA_LOG(InstanceData.Actor, Warning, TEXT("[AI] GameState is not ALOAGameState. Revive lives will not fill. (Check Game State Class in BP_LOAGameMode)"));
+	}
 
 	// 끝내지 않는다. 전투 상태가 끝날 때까지 잰다.
 	return EStateTreeRunStatus::Running;

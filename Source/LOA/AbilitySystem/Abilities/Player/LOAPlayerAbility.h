@@ -10,7 +10,9 @@
 //   후딜          : 몽타주의 "후딜 시작" 지점부터 이동/다른 행동 허용 (평캔, 이동 캔슬)
 //   발동 흐름     : 쿨타임/마나 확정 → 커서 쪽으로 회전 → StartSkill() (자식은 StartSkill만 덮어쓴다)
 //   마나 소모     : 발동할 때 마나 검사 + 차감 (ManaCost)
+//   아이덴티티    : 이 스킬로 게이지를 얼마나, 언제 채우나 (IdentityGain, IdentityGainTrigger)
 //   UI 정보       : 스킬 슬롯·툴팁에 보일 아이콘, 이름, 설명 (SkillDisplayInfo)
+//   툴팁 숫자     : 마나, 데미지 계수 읽기 (GetManaCostAtLevel, FindDamageRate). 쿨타임은 부모 GetCooldownAtLevel (2026-11-14)
 //   도우미        : 내 캐릭터 / 내 PlayerController 가져오기
 //
 // ─────────────────────────────────────────────────────────────────────────────
@@ -54,6 +56,9 @@
 // - 노티파이가 없는 몽타주는 끝날 때까지 잠금. (실수로 안 찍어도 안전한 쪽)
 // - 후딜에서 끊기는 건 "취소"가 아니라 "정상 종료"다. 할 일(타격)은 이미 끝났기 때문.
 //   후딜 전에 끊기면(기절, 회피기) 취소 종료.
+// - 몽타주보다 오래 사는 Ability(아이덴티티: 켜져 있는 동안 = Ability가 살아 있는 동안)는 (2026-11-09)
+//     bEndOnRecoveryMove = false (생성자) → 후딜 중 이동해도 끝나지 않는다
+//     몽타주가 노티파이 전에 끊겨도 EnterRecovery()로 잠금을 직접 푼다 (안 풀면 Ability가 끝날 때까지 못 움직임)
 //
 // [행동 금지 - State.Block.Ability]
 // - 모든 플레이어 Ability는 발동 차단 태그(ActivationBlockedTags)에 State.Block.Ability를 기본으로 가진다. (생성자)
@@ -94,12 +99,28 @@
 // - 차지 중 계속 줄어드는 마나는 "소모"가 아니다. 차지 스킬이 시전 중에 따로 거는 효과로 만든다.
 //
 // ─────────────────────────────────────────────────────────────────────────────
+// [아이덴티티 게이지 수급 - IdentityGain] (2026-11-09 사용자 결정)
+//   스킬마다 둘 중 하나:
+//     적 타격 (OnEnemyHit) : 판정 1번에 적이 1명 이상 맞으면 +IdentityGain. 맞은 적 수와 무관, 판정마다 (콤보는 타마다)
+//     사용     (OnUse)      : 몽타주 노티파이(LOA Send Gameplay Event, Event.Montage.IdentityGain)가 오면 +IdentityGain 1번
+//                            맞힌 사람과 무관. 노티파이 전에 끊기면(선딜 중 CC 등) 안 참. 노티파이가 여러 개여도 1번
+//   예) 낙인(적 타격 20) 헛침 → 0 / 맞힘 → +20, 기본 공격(적 타격 2) 4타 → +8
+//       버프(사용 15) 허공 → +15 / 선딜 중 끊김 → 0
+//   아이덴티티가 켜져 있으면(State.Identity.Active) 차지 않는다. 0이면 이 스킬로는 안 참
+//   게이지는 서버만 바꾼다 (ULOAGE_IdentityGain::ApplyGaugeDelta)
+//
+// ─────────────────────────────────────────────────────────────────────────────
 // [UI 정보 - SkillDisplayInfo] (2026-10-19 사용자 결정: 아이콘은 GA에)
 //   "이 스킬이 어떻게 보이나"만 가진다. 어느 키에 놓이는지는 모른다. (키는 플레이어 꾸러미가 정한다)
 //     예) GA_Berserker_Whirlwind : Icon = T_Icon_Whirlwind, Display Name = 휠윈드
 //   쓰는 곳: 내 화면 위젯 컨트롤러가 "Q에 놓인 스킬"의 이 값을 슬롯 위젯에 보낸다. (ULOAOverlayWidgetController)
 //   보스 패턴(ULOAMonsterAbility)은 이 부모가 아니라서 칸이 없다.
 //   비워 두면(회피, 평타) 스킬 슬롯 목록에서 빠진다. 아이콘이 있으면 회피도 쓸 수 있다 (화면 가운데 쿨타임).
+//   무력화 등급 (2026-11-18 apply121, 사용자 A): 툴팁의 "무력화 : 상" 한 줄. 표시용 분류라 숫자가 아니다
+//     실제로 깎는 양은 Payload의 LOAGE_Stagger + CT_SkillValues 행 (숫자는 거기 한 곳)
+//     예) 길로틴 스윙 = 상 (실제 30) / 스태빙 = 중 (실제 10 × 2타)
+//     둘이 어긋나면 저장할 때 경고 (IsDataValid: 등급만 있고 무력화 Payload가 없음 / Payload는 있는데 등급이 없음)
+//     등급을 수치에서 계산하지 않는 이유: 모듈 하나가 노티파이 여러 번 치면(휠윈드 4타) 횟수가 몽타주에만 있어 총량을 알 수 없다
 
 #pragma once
 
@@ -116,6 +137,20 @@ struct FGameplayEventData;
 struct FGameplayAbilityTargetDataHandle;
 class UTexture2D;
 
+/**
+ * 무력화 등급 (툴팁 표시용, 2026-11-18 apply121). 로아처럼 하·중·상·최상
+ * 글자("상" 등)는 툴팁 WBP 칸(Stagger Grade Texts)에 있다. UMETA DisplayName은 에디터 전용이라 게임 글자로 쓰지 않는다
+ */
+UENUM(BlueprintType)
+enum class ELOAStaggerGrade : uint8
+{
+	None	UMETA(DisplayName = "None"),
+	Low		UMETA(DisplayName = "Low"),
+	Mid		UMETA(DisplayName = "Mid"),
+	High	UMETA(DisplayName = "High"),
+	Top		UMETA(DisplayName = "Top"),
+};
+
 /** 플레이어 스킬의 UI 정보 (슬롯 아이콘, 툴팁). 숫자(쿨타임, 데미지)는 넣지 않는다 */
 USTRUCT(BlueprintType)
 struct FLOASkillDisplayInfo
@@ -130,9 +165,32 @@ struct FLOASkillDisplayInfo
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "LOA|UI")
 	FText DisplayName;
 
-	/** 스킬 설명 (툴팁, 나중에 스킬창) */
+	/**
+	 * 스킬 설명 (툴팁, 나중에 스킬창). 자리표시를 쓰면 숫자가 자동으로 들어간다 (2026-11-14)
+	 *   {Cooldown} 쿨타임 초 / {Mana} 마나 / {Damage} 공격력(BaseValue) × 첫 DamageRate = 한 번 맞을 때 데미지
+	 *   예) "주변 적을 4회 베어 회당 {Damage}의 피해를 준다." → "… 회당 2,500의 피해를 준다."
+	 *   값이 없으면(데미지 없는 스킬의 {Damage}, 로비처럼 공격력을 모를 때) 빈칸. 채우는 곳 = LOATooltipFormat::FillSkillSlotInfo
+	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "LOA|UI", meta = (MultiLine = "true"))
 	FText Description;
+
+	/**
+	 * 무력화 등급 (툴팁 "무력화 : 상" 줄, 2026-11-18). None이면 줄을 숨긴다
+	 * 표시용이다. 실제 양은 Payload의 LOAGE_Stagger (헤더 [UI 정보]). 어긋나면 저장할 때 경고
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "LOA|UI")
+	ELOAStaggerGrade StaggerGrade = ELOAStaggerGrade::None;
+};
+
+
+/** 아이덴티티 게이지가 언제 차나 (헤더 [아이덴티티 게이지 수급]) */
+UENUM(BlueprintType)
+enum class ELOAIdentityGainTrigger : uint8
+{
+	/** 판정 1번에 적이 1명 이상 맞을 때마다 */
+	OnEnemyHit	UMETA(DisplayName = "On Enemy Hit"),
+	/** 몽타주 노티파이(Event.Montage.IdentityGain)가 올 때 1번 */
+	OnUse		UMETA(DisplayName = "On Use"),
 };
 
 UCLASS(Abstract)
@@ -167,6 +225,22 @@ public:
 	/** 이 스킬의 UI 정보 (아이콘, 이름, 설명). 클래스 기본값이라 어느 컴퓨터에서나 같다 */
 	const FLOASkillDisplayInfo& GetSkillDisplayInfo() const { return SkillDisplayInfo; }
 
+	// ---------- 툴팁 숫자 (2026-11-14) : UI가 클래스 기본값에서 읽기만 한다 ----------
+
+	/** 그 레벨의 마나 소모. 0 = 소모 없음 */
+	float GetManaCostAtLevel(float Level) const { return ManaCost.GetValueAtLevel(Level); }
+
+	/**
+	 * 모듈 순서 → Payload 순서로 훑어 처음 나오는 SetByCaller.DamageRate 값 (그 레벨). 없으면 false
+	 * = 한 번 맞을 때의 계수 (사용자 A). 차지 배율은 넣지 않는다 (1단계 기준, 대신 정함)
+	 *   예) 휠윈드 Modules[0] Apply : DamageRate 2.5 → 2.5 (노티파이가 4개여도 2.5. 횟수는 설명 글에)
+	 *       단두대 Modules[0] Spawn : BP_Area_GuillotineSwing에 넘기는 Payloads의 DamageRate
+	 */
+	bool FindDamageRate(float Level, float& OutDamageRate) const;
+
+	/** 모듈의 Payload 중 SetByCaller.Stagger 값이 있나 (무력화가 있는 스킬인가, 2026-11-18). 등급 칸과 맞는지 저장할 때 본다 */
+	bool HasStaggerPayload() const;
+
 	//~ Begin UGameplayAbility Interface
 	/** 현재 마나가 ManaCost 이상인지. 부족하면 false → 발동 거부 */
 	virtual bool CheckCost(
@@ -180,6 +254,16 @@ public:
 		const FGameplayAbilityActorInfo* ActorInfo,
 		const FGameplayAbilityActivationInfo ActivationInfo) const override;
 	//~ End UGameplayAbility Interface
+
+	//~ Begin ULOAGameplayAbility Interface
+	/** 적 타격형이면 적이 맞았을 때 아이덴티티 게이지 + (헤더 [아이덴티티 게이지 수급]) */
+	virtual void NotifyPayloadsApplied(bool bHitEnemy) override;
+	//~ End ULOAGameplayAbility Interface
+
+#if WITH_EDITOR
+	/** 부모 검사 + 사용형 수급인데 이 GA의 몽타주에 Event.Montage.IdentityGain 노티파이가 없으면 경고 (몽타주를 직업 표에서 고르면 검사 못 함) */
+	virtual EDataValidationResult IsDataValid(class FDataValidationContext& Context) const override;
+#endif
 
 protected:
 	//~ Begin UGameplayAbility Interface
@@ -263,11 +347,52 @@ protected:
 	UPROPERTY(EditDefaultsOnly, Category = "LOA|Ability|Cost")
 	FScalableFloat ManaCost;
 
+	/** 이 스킬이 채우는 아이덴티티 게이지 양. 0이면 안 참. 헤더 [아이덴티티 게이지 수급] */
+	UPROPERTY(EditDefaultsOnly, Category = "LOA|Ability|Identity")
+	FScalableFloat IdentityGain;
+
+	/** 아이덴티티 게이지가 언제 차나: 적 타격(판정마다) / 사용(노티파이 Event.Montage.IdentityGain에 1번) */
+	UPROPERTY(EditDefaultsOnly, Category = "LOA|Ability|Identity")
+	ELOAIdentityGainTrigger IdentityGainTrigger = ELOAIdentityGainTrigger::OnEnemyHit;
+
+	/** [서버] 아이덴티티 게이지 +IdentityGain. 켜져 있거나(State.Identity.Active) 0이면 아무것도 안 함 */
+	void GrantIdentityGain(const FGameplayAbilityActorInfo* ActorInfo, float Level) const;
+
+	/** [서버] 사용형 수급 노티파이 기다리기 시작 (PreActivate. 후딜 대기와 같은 방식) */
+	void ListenIdentityGainEvent(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo);
+
+	/** 사용형 수급 노티파이 대기 해제 (받았을 때 / 종료) */
+	void StopListeningIdentityGain();
+
+	/** 사용형 수급 노티파이가 왔다 → 1번 채우고 대기 해제 */
+	void OnIdentityGainEvent(const FGameplayEventData* Payload);
+
+	/** 사용형 수급 노티파이 대기 핸들 */
+	FDelegateHandle IdentityGainEventHandle;
+
 	/** 스킬 슬롯·툴팁에 보일 아이콘, 이름, 설명. 헤더 [UI 정보] */
 	UPROPERTY(EditDefaultsOnly, Category = "LOA|UI")
 	FLOASkillDisplayInfo SkillDisplayInfo;
 
+	// ---------- 후딜 (자식용) ----------
+	/**
+	 * 후딜 중 이동하면 Ability를 끝낼지. 기본 true (이동 캔슬)
+	 * 몽타주보다 오래 사는 Ability(아이덴티티)는 생성자에서 false: 끝나면 효과까지 꺼지므로 (헤더 [후딜], 2026-11-09)
+	 * C++에서만 정한다 (사용자 결정: BP 칸으로 열지 않음. 스킬 데이터가 아니라 클래스 성질)
+	 */
+	bool bEndOnRecoveryMove = true;
+
+	/**
+	 * 후딜 상태로: 잠금(이동/행동 금지) 해제 + (bEndOnRecoveryMove면) 이동 캔슬 구독. 이미 후딜이면 아무것도 안 함
+	 * 보통은 Event.Montage.Unlock 노티파이가 부른다. 노티파이 전에 몽타주가 끊겨도 Ability가 남는 자식이 직접 부른다
+	 */
+	void EnterRecovery();
+
 private:
+	// ---------- 툴팁 숫자 ----------
+	/** 모듈 → Payload → 값 순서로 훑어 처음 나오는 ValueTag 값 (그 레벨). 없으면 false. FindDamageRate·HasStaggerPayload가 같이 쓴다 */
+	bool FindFirstSetByCallerValue(const FGameplayTag& ValueTag, float Level, float& OutValue) const;
+
 	// ---------- 스킬 시작 ----------
 	/**
 	 * 스킬 시작 = 모듈 켜기 → StartSkill.
@@ -300,7 +425,7 @@ private:
 	void ApplyLock(const FGameplayAbilityActorInfo* ActorInfo);
 
 	// ---------- 후딜 ----------
-	/** "후딜 시작" 이벤트(Event.Montage.Unlock)가 왔다. 잠금을 풀고 후딜 상태로 */
+	/** "후딜 시작" 이벤트(Event.Montage.Unlock)가 왔다 → EnterRecovery */
 	void OnUnlockEvent(const FGameplayEventData* Payload);
 
 	/** 후딜 중에 이동이 시작됐다 → 남은 몽타주를 끊고 정상 종료 */
@@ -330,4 +455,4 @@ private:
 	/** 이동 시작 알림 구독 번호표 + 구독한 클릭 이동 부품 */
 	FDelegateHandle MoveStartedHandle;
 	TWeakObjectPtr<ULOAClickMoveComponent> ListenedClickMove;
-};
+};

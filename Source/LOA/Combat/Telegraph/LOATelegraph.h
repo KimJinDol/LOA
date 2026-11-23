@@ -20,6 +20,7 @@
 //   이 액터는 매 프레임 아무것도 하지 않는다. (Tick 없음)
 //   꺼낼 때 머티리얼 사본에 StartTime, HitTime을 한 번 쓰면, 머티리얼이 MPC_Telegraph의 ServerTime을 보고 스스로 차오른다.
 //   예) StartTime 100.0, HitTime 101.2, 지금 ServerTime 101.0 → (101.0 − 100.0) ÷ 1.2 = 83%
+//   HitTime 칸 = 꽉 차는 시각 (FLOATelegraphData::FillServerTime). 꽉 찬 뒤 터지는 장판은 판정 시각까지 꽉 찬 채로 남는다 (2026-10-31)
 //
 // [데칼 방향]
 //   데칼은 자기 X축 방향으로 투영된다. 데칼을 Pitch −90으로 붙이면 X가 바닥을 향한다.

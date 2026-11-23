@@ -34,13 +34,34 @@
 			"Name": "GameplayAbilities",
 			"Enabled": true
 		},
-   		{
-        		"Name": "StateTree",
-        		"Enabled": true
-    		},
-    		{
-        		"Name": "GameplayStateTree",
-        		"Enabled": true
-    		}
+		{
+			"Name": "StateTree",
+			"Enabled": true
+		},
+		{
+			"Name": "GameplayStateTree",
+			"Enabled": true
+		},
+		{
+			"Name": "OnlineSubsystem",
+			"Enabled": true
+		},
+		{
+			"Name": "OnlineSubsystemUtils",
+			"Enabled": true
+		},
+		{
+			"Name": "OnlineSubsystemNull",
+			"Enabled": true
+		},
+		{
+			"Name": "EngineWire",
+			"Enabled": true,
+			"SupportedTargetPlatforms": [
+				"Win64",
+				"Mac",
+				"Linux"
+			]
+		}
 	]
 }

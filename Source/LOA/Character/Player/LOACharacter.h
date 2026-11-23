@@ -23,6 +23,26 @@
 //   (A) ASC 연결 완료       - 서버: PossessedBy / 클라이언트: OnRep_PlayerState
 //   (B) 직업 데이터 수신 완료 - 서버: SetCharacterClassData / 클라이언트: OnRep_CharacterClassData
 // 두 경로 모두 TryFinalizeInitialization()으로 모이며, 마지막에 도착한 쪽이 초기화를 완료시킨다.
+//
+// [사망 / 부활 / 낙사] (2026-10-23)
+//   사망 : 체력 0 → Event.Trigger.Death → GA_Death(State.Body.Dead) → 이 캐릭터의 ULOADeathReactionComponent가 충돌·이동을 끔 [모든 컴퓨터]
+//   부활 : ReviveFromDeath() [서버]. 죽은 자리에서 일어난다.
+//          ① 돌고 있는 GA_Death 취소 ② 체력 가득 ③ State.Body.Invulnerable N초 ④ State.Body.Dead 제거 → 몸이 되돌아옴
+//          목숨 확인은 부르는 쪽(ALOAPlayerController::ServerRequestRevive)이 한다.
+//   낙사 : 엔진이 KillZ 아래로 떨어진 액터에 FellOutOfWorld를 부른다. 엔진 기본은 액터를 지운다 → 덮어쓴다.
+//          서버: 마지막으로 밟은 땅으로 옮김 → 체력 0 (보통 사망 경로) → 부활하면 그 자리에서 일어남
+//          클라: 아무것도 안 함 (엔진도 클라에서는 안 지움). 서버가 ClientSnapToLocation으로 같은 자리로 옮겨 준다.
+//   전멸 : 서버에서 죽으면 ALOAGameState::NotifyPlayerDied → 전멸 확인. 전멸 3초 뒤 RespawnAt(부활 자리) [서버]
+//   "마지막으로 밟은 땅" : 서버가 0.25초마다, 땅을 걷는 중이고 몸 중심 바로 아래에 바닥이 있으면 저장
+//          (낭떠러지 끝에 걸쳐 선 위치는 저장하지 않음 → 옮겨도 다시 떨어지지 않게)
+//   무너진 지형 (2026-11-14, ALOATerrainZone) : 사용자 규칙 "시체는 언제나 부활할 수 있는 곳에"
+//          마지막으로 밟은 땅이 무너진 구역 안이면 → 가운데 원(안 무너짐) 안쪽으로 (ULOARaidSubsystem::FindRecoverLocation)
+//          예) 왼쪽 반쪽 고리 위에서 예고를 못 피함 → 떨어짐 → KillZ → 마지막으로 밟은 땅 = 구역 안 → 가운데 원 가장자리 안쪽에서 죽음
+//          무너진 구역 위 허공에서 죽어도 같은 자리로 (HandleDiedOnServer). 이미 시체인 채로 구역이 무너지면 상황판이 옮긴다
+//
+// [BP에서 설정할 것] BP_LOAHero
+//   LOA|Revive : Revive Invulnerable Duration (기본 3초)
+//   레벨의 World Settings → Kill Z : 떨어지면 죽을 높이 (바닥보다 충분히 아래)
 
 #pragma once
 
@@ -36,6 +56,9 @@ class ULOACharacterClassData;
 class USpringArmComponent;
 class UCameraComponent;
 class UActorComponent;
+class ULOADeathReactionComponent;
+class ULOAJustGuardComponent;
+class ULOACrowdControlPredictionComponent;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FLOACharacterInitializedSignature, ALOACharacter*, InitializedCharacter);
 
@@ -53,7 +76,10 @@ public:
 
 	//~ Begin AActor Interface
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	/** KillZ 아래로 떨어짐. 엔진 기본(액터 삭제) 대신 낙사 처리 (헤더 [사망 / 부활 / 낙사]) */
+	virtual void FellOutOfWorld(const UDamageType& DmgType) override;
 	//~ End AActor Interface
 
 	//~ Begin APawn Interface
@@ -84,6 +110,38 @@ public:
 	 */
 	UPROPERTY(BlueprintAssignable, Category = "LOA|Character")
 	FLOACharacterInitializedSignature OnCharacterInitialized;
+
+	// ---------- 사망 / 부활 ----------
+	/** 죽어 있나 (State.Body.Dead). 모든 컴퓨터 */
+	UFUNCTION(BlueprintPure, Category = "LOA|Revive")
+	bool IsDead() const;
+
+	/**
+	 * [서버] 죽어 있으면 살린다. 죽은 자리에서 체력 가득 + 무적 N초. 살렸으면 true.
+	 * 공용 목숨 확인·차감은 부르는 쪽이 한다. (ALOAPlayerController::ServerRequestRevive)
+	 */
+	bool ReviveFromDeath(bool bGrantInvulnerability = true);
+
+	/**
+	 * [서버] 전멸 뒤 부활: 죽어 있으면 살리고(무적 없음), 이 자리로 옮긴다. 살아 있어도 옮긴다.
+	 * 주인 클라도 같은 자리로 바로 옮긴다 (ClientSnapToLocation).
+	 */
+	void RespawnAt(const FVector& Location);
+
+	/**
+	 * [서버] 살리지 않고 몸만 이 자리로 옮긴다 (시체도 옮겨짐). 주인 클라도 바로 옮기고, 낙사 복귀 자리도 여기로.
+	 * 쓰는 곳: 낙사, 전멸 뒤 부활(RespawnAt), 무너진 구역 안 시체 (ULOARaidSubsystem), 대난투 차원 이동 (ALOABrawlArena)
+	 */
+	void RelocateBody(const FVector& Location);
+
+	/**
+	 * [본인 컴퓨터] 카메라 거리 배율 (2026-11-18 apply122). 1 = BP에서 정한 거리, 0.6 = 60% 거리 (줌인)
+	 * 부르는 곳: ALOAPlayerController가 매 프레임 (대난투 연출). 기준 거리는 BeginPlay 때 CameraBoom의 TargetArmLength
+	 */
+	void SetCameraZoomScale(float Scale);
+
+	UFUNCTION(BlueprintPure, Category = "LOA|Character")
+	ULOADeathReactionComponent* GetDeathReactionComponent() const { return DeathReactionComponent; }
 
 protected:
 	/** 파생 클래스 확장 지점. 오버라이드 시 부모 호출 필수 */
@@ -121,6 +179,21 @@ private:
 	/** 초기화 상태 및 ASC 연결 해제 (UnPossessed / EndPlay) */
 	void UninitializeCharacter();
 
+	// ---------- 낙사 ----------
+	/** [서버] 땅을 걷는 중이고 몸 중심 아래에 바닥이 있으면 지금 위치를 "마지막으로 밟은 땅"으로 저장 */
+	void RecordLastGroundLocation();
+
+	/**
+	 * [서버 → 이 캐릭터 주인 컴퓨터] 서버가 옮긴 자리로 같이 옮긴다. (주인 컴퓨터는 이동 보정을 기다리지 않음)
+	 * 낙사(곧 이동이 꺼져 보정이 안 옴), 전멸 뒤 부활(멀리 순간이동)에서 쓴다.
+	 */
+	UFUNCTION(Client, Reliable)
+	void ClientSnapToLocation(FVector_NetQuantize Location);
+
+	/** [서버] 사망 반응 부품이 "죽었다"고 알릴 때 → GameState에 알림 (전멸 확인). AddDynamic이라 UFUNCTION */
+	UFUNCTION()
+	void HandleDiedOnServer(AActor* DeadActor);
+
 	// ---------- Components ----------
 	/** 탑쿼터뷰 카메라 암. 월드 기준 고정 각도(캐릭터 회전을 따라가지 않음). 거리/각도는 BP에서 설정 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LOA|Camera", meta = (AllowPrivateAccess = "true"))
@@ -128,6 +201,21 @@ private:
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LOA|Camera", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UCameraComponent> TopDownCamera;
+
+	/** BP에서 정한 카메라 거리 (BeginPlay 때 기억). 줌 배율의 기준 */
+	float DefaultCameraArmLength = 0.f;
+
+	/** State.Body.Dead → 충돌·이동 끄기/되돌리기 [모든 컴퓨터]. 보스와 같은 부품 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LOA|Death", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<ULOADeathReactionComponent> DeathReactionComponent;
+
+	/** 저스트 가드 장부 (누른 시각·뗀 시각). 조종하는 사람 = 원본, 서버 = 사본. 판정 담당이 맞는 순간 본다 (2026-10-26) */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LOA|Combat", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<ULOAJustGuardComponent> JustGuardComponent;
+
+	/** 예측 피격 반응: 피해자 판정 "맞음"이면 서버 CC 전에 먼저 멈춤·CC 몽타주 [조종하는 사람 컴퓨터] (2026-10-31) */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LOA|Combat", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<ULOACrowdControlPredictionComponent> CrowdControlPredictionComp;
 
 	/** 직업 데이터로부터 런타임 생성된 컴포넌트 (각 컴퓨터 로컬 추적용) */
 	UPROPERTY(Transient)
@@ -138,10 +226,24 @@ private:
 	UPROPERTY(ReplicatedUsing = OnRep_CharacterClassData, VisibleInstanceOnly, Category = "LOA|Character")
 	TObjectPtr<const ULOACharacterClassData> CharacterClassData;
 
+	// ---------- 부활 / 낙사 설정 ----------
+	/** 부활 직후 무적 시간 (초). 0이면 무적 없음 */
+	UPROPERTY(EditDefaultsOnly, Category = "LOA|Revive", meta = (ClampMin = "0.0", Units = "Seconds"))
+	float ReviveInvulnerableDuration = 3.f;
+
+	/** "마지막으로 밟은 땅"을 저장하는 간격 (초) [서버] */
+	UPROPERTY(EditDefaultsOnly, Category = "LOA|Revive", meta = (ClampMin = "0.05", Units = "Seconds"))
+	float LastGroundRecordInterval = 0.25f;
+
+	/** [서버] 마지막으로 밟은 땅. 처음엔 스폰 위치 */
+	FVector LastGroundLocation = FVector::ZeroVector;
+
+	FTimerHandle LastGroundTimerHandle;
+
 	/** PlayerState의 ASC 캐시. 소유하지 않으므로 약한 참조 */
 	TWeakObjectPtr<UAbilitySystemComponent> CachedAbilitySystemComponent;
 
 	/** 로컬 상태 플래그 (복제하지 않음: 컴퓨터마다 도착 순서가 다르다) */
 	uint8 bAbilityActorInfoReady : 1;
 	uint8 bCharacterInitialized : 1;
-};
+};

@@ -3,6 +3,7 @@
 #include "Actors/LOATrainingDummy.h"
 #include "AbilitySystem/LOAAbilitySystemComponent.h"
 #include "AbilitySystem/Attributes/LOAAttributeSet_Common.h"
+#include "AbilitySystem/Attributes/LOAAttributeSet_Combat.h"
 #include "Data/LOAAbilityDataSet.h"
 #include "Core/LOALog.h"
 
@@ -49,6 +50,10 @@ ALOATrainingDummy::ALOATrainingDummy(const FObjectInitializer& ObjectInitializer
 
 	// ---------- 체력 칸 ----------
 	CommonAttributeSet = CreateDefaultSubobject<ULOAAttributeSet_Common>(TEXT("CommonAttributeSet"));
+
+	// ---------- 전투 칸 (2026-11-13) ----------
+	// Combat = 전투 관련 스탯창 (때리는 쪽 + 맞는 쪽). 허수아비도 맞는 쪽 칸(낙인, 치명타 저항)이 필요하다. 헤더 CombatAttributeSet 설명
+	CombatAttributeSet = CreateDefaultSubobject<ULOAAttributeSet_Combat>(TEXT("CombatAttributeSet"));
 }
 
 UAbilitySystemComponent* ALOATrainingDummy::GetAbilitySystemComponent() const

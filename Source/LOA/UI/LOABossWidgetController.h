@@ -2,11 +2,16 @@
 // [배관] 보스 체력바용 위젯 컨트롤러. 보스의 ASC를 지켜보다가 위젯에게 알림을 쏜다. (Overlay 컨트롤러와 같은 역할 분담)
 //
 // ─────────────────────────────────────────────────────────────────────────────
-// [알림 2가지]
+// [알림 3가지]
 //   OnBossInfoChanged(이름, 줄 수)      : 보스가 정해졌을 때 한 번. 이름표와 "x줄" 계산용
 //   OnBossHealthChanged(현재, 최대)     : 체력 또는 최대 체력이 바뀜 (FLOAVitalChangedSignature, 내 체력 바와 같은 모양)
+//   OnBossStaggerChanged(현재, 최대)    : 무력화 게이지가 바뀜 (2026-11-18 apply120, 같은 모양)
+//                                         무력화가 없는 보스는 (0, 0) → 위젯은 최대가 0이면 게이지를 숨긴다
 //
-// 위젯은 보스가 누구인지, ASC가 어디 있는지 모른다. 이 두 알림만 받아서 그린다.
+// 위젯은 보스가 누구인지, ASC가 어디 있는지 모른다. 이 알림만 받아서 그린다.
+//
+// [상태 아이콘] (2026-11-10) 상태 일은 ULOAStatusTracker가 한다. 이 컨트롤러는 하나를 들고 있다 → GetStatusTracker()
+//   보스 ASC는 Minimal이라 GE가 클라에 없다 → Tracker에 보스의 ULOAStatusReplicationComponent를 넘겨 남은 시간은 거기서 읽게 한다
 //
 // [줄 수 계산은 위젯이 한다] (로아 보스 체력바 "x123")
 //   한 줄 체력 = 최대 ÷ 줄 수
@@ -39,6 +44,7 @@
 
 class ALOABossCharacter;
 class UAbilitySystemComponent;
+class ULOAStatusTracker;
 
 /** 보스 이름표. 줄 수는 1 이상 */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FLOABossInfoSignature, FText, BossName, int32, HealthBarLines);
@@ -55,7 +61,7 @@ public:
 	 */
 	void Init(ALOABossCharacter* InBoss);
 
-	/** 이름/줄 수 + 지금 체력을 한 번 보낸다. 위젯이 OnWidgetControllerSet에서 바인딩을 끝낸 "다음"에 HUD가 호출한다. */
+	/** 이름/줄 수 + 지금 체력·무력화를 한 번 보낸다. 위젯이 OnWidgetControllerSet에서 바인딩을 끝낸 "다음"에 HUD가 호출한다. */
 	void BroadcastInitialValues();
 
 	/** 걸어 둔 알림을 전부 해제한다. HUD가 체력바를 내릴 때 호출. 두 번 불려도 안전 */
@@ -65,6 +71,10 @@ public:
 	UFUNCTION(BlueprintPure, Category = "LOA|UI|Boss")
 	ALOABossCharacter* GetBoss() const { return Boss.Get(); }
 
+	/** 보스 상태(버프·디버프·상태 이상) 지켜보기. 아이콘 줄이 쓴다. Init 전·보스 ASC가 없으면 nullptr */
+	UFUNCTION(BlueprintPure, Category = "LOA|UI|Boss")
+	ULOAStatusTracker* GetStatusTracker() const { return StatusTracker; }
+
 	// ---------- 위젯이 바인딩할 알림 ----------
 	UPROPERTY(BlueprintAssignable, Category = "LOA|UI|Boss")
 	FLOABossInfoSignature OnBossInfoChanged;
@@ -72,10 +82,18 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "LOA|UI|Boss")
 	FLOAVitalChangedSignature OnBossHealthChanged;
 
+	/** 무력화 게이지 (현재, 최대). 최대가 0이면 무력화가 없는 보스 → 숨김 (2026-11-18 apply120) */
+	UPROPERTY(BlueprintAssignable, Category = "LOA|UI|Boss")
+	FLOAVitalChangedSignature OnBossStaggerChanged;
+
 private:
 	/** Health, MaxHealth 둘 중 무엇이 바뀌어도 여기로 온다. 현재/최대를 다시 읽어서 보낸다 */
 	void HandleHealthChanged(const FOnAttributeChangeData& Data);
 	void BroadcastHealth() const;
+
+	/** Stagger, MaxStagger 둘 중 무엇이 바뀌어도 여기로 온다. 체력과 같은 방식 */
+	void HandleStaggerChanged(const FOnAttributeChangeData& Data);
+	void BroadcastStagger() const;
 
 	// ---------- 지켜보는 대상 (소유하지 않음) ----------
 	TWeakObjectPtr<ALOABossCharacter> Boss;
@@ -83,7 +101,13 @@ private:
 	/** 보스 몸에 있는 ASC. 보스가 사라지면 같이 사라진다 */
 	TWeakObjectPtr<UAbilitySystemComponent> ASC;
 
+	/** 상태 지켜보기 (이 컨트롤러가 만들고 가진다) */
+	UPROPERTY(Transient)
+	TObjectPtr<ULOAStatusTracker> StatusTracker;
+
 	// ---------- 해제용 번호표 ----------
 	FDelegateHandle HealthChangedHandle;
 	FDelegateHandle MaxHealthChangedHandle;
+	FDelegateHandle StaggerChangedHandle;
+	FDelegateHandle MaxStaggerChangedHandle;
 };

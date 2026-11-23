@@ -25,7 +25,7 @@ void ULOASkillTargeting_Shape::FindTargets(const FLOASkillModuleContext& Context
 	ULOACombatLibrary::FindTargetsInShape(Source, Shape, Filter, ObjectType, Found, bDrawRange, Context.Caster);
 
 	// ② 맞은 지점의 기준 = 모양의 기준점 (Sphere = 중심, Fan = 꼭짓점, Box = 뒷변 가운데).
-	//    대상 캡슐 표면에서 이 점과 가장 가까운 곳이 맞은 지점이 된다.
+	//    대상 캡슐 표면에서 이 점과 가장 가까운 곳이 맞은 지점이 된다. (높이는 대상 몸 가운데: MakeShapeHitResult. 기준점이 바닥이어도 숫자가 발밑에 안 뜨게)
 	//    (보스 왼쪽에서 때리면 보스 캡슐의 왼쪽 면 → 데미지 숫자도 그 자리에 뜬다)
 	const FVector ShapeCenter = ULOACombatLibrary::GetShapeCenter(Source, Shape);
 
@@ -42,7 +42,7 @@ void ULOASkillTargeting_Shape::FindTargets(const FLOASkillModuleContext& Context
 		// ③ 추가. 충돌체가 없는 대상(드묾)은 맞은 지점 없이 들어간다.
 		FLOATargetHit& NewHit = OutHits.AddDefaulted_GetRef();
 		NewHit.Target = Target;
-		NewHit.bHasHitPoint = ULOACombatLibrary::MakeClosestHitResult(Target, ShapeCenter, NewHit.HitResult);
+		NewHit.bHasHitPoint = ULOACombatLibrary::MakeShapeHitResult(Target, ShapeCenter, NewHit.HitResult);
 	}
 }
 
@@ -67,3 +67,16 @@ EDataValidationResult ULOASkillTargeting_Shape::ValidateTargeting(FDataValidatio
 	return Result;
 }
 #endif
+
+bool ULOASkillTargeting_Shape::GetRange(FLOAHitShape& OutShape, ELOATargetFilter& OutFilter) const
+{
+	OutShape = Shape;
+	OutFilter = Filter;
+	return true;
+}
+
+FVector ULOASkillTargeting_Shape::GetAttackOrigin(const AActor* Source) const
+{
+	// 예) 보스 앞 부채꼴 = 꼭짓점(보스 쪽) / 떨어지는 돌 장판 = 장판 위치
+	return Source ? ULOACombatLibrary::GetShapeCenter(Source, Shape) : FVector::ZeroVector;
+}

@@ -124,6 +124,12 @@ public:
 	/** Ability가 끝날 때 부른다. SkillModuleEnd를 부르고 주인을 잊는다. */
 	void DeactivateModule(bool bWasCancelled);
 
+	/**
+	 * 이 모듈이 대상에게 주는 GE 목록. 없는 모듈(Move 등)은 nullptr. (2026-11-14 툴팁)
+	 * 읽기만 한다. 예) 툴팁 {Damage} = 공격력 × 첫 SetByCaller.DamageRate (ULOAPlayerAbility::FindDamageRate)
+	 */
+	virtual const TArray<FLOAEffectPayload>* GetPayloads() const { return nullptr; }
+
 #if WITH_EDITOR
 	/**
 	 * [에디터 전용] 저장 시 검사. 주인 GA의 IsDataValid가 모듈마다 부른다.

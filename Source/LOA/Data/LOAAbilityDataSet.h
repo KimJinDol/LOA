@@ -280,6 +280,9 @@ public:
 	virtual EDataValidationResult IsDataValid(class FDataValidationContext& Context) const override;
 #endif
 
+	/** 스킬 목록 읽기. 로비 스킬 목록이 쓴다 (ASC 없이 꾸러미에서 바로, 2026-11-14 apply113) */
+	const TArray<FLOAPlayerAbilityDataSet_Ability>& GetGrantedAbilities() const { return GrantedAbilities; }
+
 protected:
 	virtual void GiveAbilities(UAbilitySystemComponent* ASC, FLOAAbilityDataSet_GrantedHandles* OutGrantedHandles, UObject* SourceObject) const override;
 

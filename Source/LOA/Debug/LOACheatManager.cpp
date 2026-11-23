@@ -1,9 +1,13 @@
 // LOACheatManager.cpp
 
 #include "Debug/LOACheatManager.h"
+#include "Debug/LOAPlayerCheats.h"
 #include "Player/LOAPlayerController.h"
 #include "AbilitySystem/Abilities/Monster/LOAMonsterAbility.h"
 #include "AbilitySystem/Attributes/LOAAttributeSet_Common.h"
+#include "AbilitySystem/Attributes/LOAAttributeSet_Boss.h"
+#include "AbilitySystem/Effects/LOAGE_Stagger.h"
+#include "AbilitySystemGlobals.h"
 #include "AI/LOAMonsterAIController.h"
 #include "Character/Monster/Boss/LOABossCharacter.h"
 #include "Character/Player/LOACharacter.h"
@@ -12,11 +16,14 @@
 #include "Data/LOAAbilityDataSet.h"
 #include "Data/LOACharacterClassData.h"
 #include "Game/LOARaidSubsystem.h"
+#include "Actors/LOATerrainZone.h"
 #include "Library/LOACombatLibrary.h"
 
 #include "AbilitySystemComponent.h"
 #include "Blueprint/UserWidget.h"
+#include "Components/StateTreeAIComponent.h"
 #include "Engine/World.h"
+#include "TimerManager.h"
 #include "GameFramework/GameStateBase.h"
 #include "GameFramework/PlayerState.h"
 #include "Kismet/GameplayStatics.h"
@@ -76,8 +83,22 @@ namespace LOACheat
 }
 
 // =============================================================================
-// 서버로 보내기 / 대상 찾기
+// 확장 · 공용 도우미
 // =============================================================================
+
+void ULOACheatManager::InitCheatManager()
+{
+	Super::InitCheatManager();
+
+	// 플레이어 테스터 (BP에서 지정 안 했으면 C++ 기본 클래스. 창은 BP 자식에서 지정)
+	const TSubclassOf<ULOAPlayerCheats> ExtensionClass = PlayerCheatsClass ? PlayerCheatsClass : TSubclassOf<ULOAPlayerCheats>(ULOAPlayerCheats::StaticClass());
+	AddCheatManagerExtension(NewObject<ULOAPlayerCheats>(this, ExtensionClass));
+}
+
+FString ULOACheatManager::GetPlayerClassName(const APawn* Pawn)
+{
+	return LOACheat::GetClassName(Pawn);
+}
 
 bool ULOACheatManager::ForwardToServer(const FString& Command) const
 {
@@ -227,9 +248,152 @@ void ULOACheatManager::LOABossAI(const FString& Mode)
 		return;
 	}
 
+	// 내가 건 왕복이 있으면 먼저 끝내고 걷던 길도 지운다 (재개는 이동을 멈추지 않아서, 안 지우면 왕복 점까지 마저 걸어감)
+	//   다른 플레이어가 건 왕복은 AI가 이동을 끊을 때 그쪽이 스스로 끝난다
+	if (SweepController.IsValid())
+	{
+		StopBossSweep(bPause ? TEXT("AI paused") : TEXT("AI resumed"));
+		BossController->StopMovement();
+	}
+
 	BossController->SetBrainPaused(bPause);
 	LOA_LOG(this, Display, TEXT("[Cheat] %s %s the boss AI."), *GetNameSafe(GetOuterAPlayerController()),
 		bPause ? TEXT("paused") : TEXT("resumed"));
+}
+
+// =============================================================================
+// 보스 왕복 (헤더 [보스 왕복 LOABossSweep])
+// =============================================================================
+
+void ULOACheatManager::LOABossSweep(float Distance, float WaitSeconds)
+{
+	if (ForwardToServer(FString::Printf(TEXT("LOABossSweep %.0f %.2f"), Distance, WaitSeconds)))
+	{
+		return;
+	}
+
+	ALOABossCharacter* Boss = LOACheat::FindBoss(this);
+	ALOAMonsterAIController* BossController = Boss ? Cast<ALOAMonsterAIController>(Boss->GetController()) : nullptr;
+	const APlayerController* PC = GetOuterAPlayerController();
+	const APawn* MyPawn = PC ? PC->GetPawn() : nullptr;
+	if (!BossController || !MyPawn)
+	{
+		LOA_LOG(this, Warning, TEXT("[Cheat] Boss sweep needs a boss with a LOAMonsterAIController and your character."));
+		return;
+	}
+	if (Distance <= 0.f)
+	{
+		LOA_LOG(this, Warning, TEXT("[Cheat] Usage: LOABossSweep [distance > 0] [wait seconds]"));
+		return;
+	}
+
+	// 전에 건 왕복은 버린다 (알림 구독을 먼저 끊어야 아래 AI 멈춤의 "이동 끊김" 알림을 안 받는다)
+	StopBossSweep(TEXT("restarted"));
+
+	// AI 멈춤 = 트리 정지 + 걷던 길 지우기 (LOABossAI Pause와 같음)
+	BossController->SetBrainPaused(true);
+
+	// "보스 → 나" 선 (바닥 기준). 보스가 내 자리에 딱 있으면 보스가 보는 방향
+	const FVector MyLocation = MyPawn->GetActorLocation();
+	FVector Direction = (MyLocation - Boss->GetActorLocation()).GetSafeNormal2D();
+	if (Direction.IsNearlyZero())
+	{
+		Direction = Boss->GetActorForwardVector().GetSafeNormal2D();
+	}
+
+	// 0 = 나를 지나 먼 쪽 (먼저 감), 1 = 보스가 있던 쪽
+	SweepPoints[0] = MyLocation + Direction * Distance;
+	SweepPoints[1] = MyLocation - Direction * Distance;
+	SweepTargetIndex = 0;
+	SweepWaitSeconds = FMath::Max(0.f, WaitSeconds);
+	SweepController = BossController;
+	BossController->ReceiveMoveCompleted.AddUniqueDynamic(this, &ThisClass::OnSweepMoveCompleted);
+
+	LOA_LOG(this, Display, TEXT("[Cheat] %s started a boss sweep: %.0fcm each side of %s, wait %.2fs. End with LOABossAI Resume | Pause"),
+		*GetNameSafe(PC), Distance, *MyLocation.ToCompactString(), SweepWaitSeconds);
+
+	MoveToNextSweepPoint();
+}
+
+void ULOACheatManager::MoveToNextSweepPoint()
+{
+	ALOAMonsterAIController* BossController = SweepController.Get();
+	const APawn* BossPawn = BossController ? BossController->GetPawn() : nullptr;
+	if (!BossPawn)
+	{
+		StopBossSweep(TEXT("no boss"));
+		return;
+	}
+
+	// 멈춰 있는 동안 AI가 다시 켜졌거나(다른 플레이어의 Resume) 보스가 죽었으면 끝
+	const UStateTreeAIComponent* StateTree = BossController->GetStateTreeComponent();
+	const ALOABossCharacter* Boss = Cast<ALOABossCharacter>(BossPawn);
+	const UAbilitySystemComponent* ASC = Boss ? Boss->GetAbilitySystemComponent() : nullptr;
+	if ((StateTree && StateTree->IsRunning()) || (ASC && ASC->HasMatchingGameplayTag(LOAGameplayTags::State_Body_Dead)))
+	{
+		StopBossSweep(TEXT("AI running or boss dead"));
+		return;
+	}
+
+	// StateTree의 Move To와 같은 길찾기 걷기.
+	//   bStopOnOverlap false = 보스 반지름만큼 앞에서 서지 않고 그 점까지 / 점이 내비메시 밖이면 내비메시 위로 옮김 / 못 가면 갈 수 있는 데까지
+	const FVector& Point = SweepPoints[SweepTargetIndex];
+	const EPathFollowingRequestResult::Type Request = BossController->MoveToLocation(Point, /*AcceptanceRadius*/ -1.f, /*bStopOnOverlap*/ false,
+		/*bUsePathfinding*/ true, /*bProjectDestinationToNavigation*/ true, /*bCanStrafe*/ false, /*FilterClass*/ nullptr, /*bAllowPartialPath*/ true);
+	if (Request == EPathFollowingRequestResult::Failed)
+	{
+		LOA_LOG(this, Warning, TEXT("[Cheat] Boss sweep: no path to %s. Stopped."), *Point.ToCompactString());
+		StopBossSweep(TEXT("no path"));
+		return;
+	}
+
+	LOA_LOG(this, Log, TEXT("[Cheat] Boss sweep: walking to point %d %s"), SweepTargetIndex, *Point.ToCompactString());
+}
+
+void ULOACheatManager::OnSweepMoveCompleted(FAIRequestID RequestID, EPathFollowingResult::Type Result)
+{
+	// 성공이 아님 = 누가 이동을 끊었다 (AI 멈춤·재개, 사망, 전멸) → 왕복 끝, 보스는 그대로
+	if (Result != EPathFollowingResult::Success)
+	{
+		StopBossSweep(TEXT("move interrupted"));
+		return;
+	}
+
+	// 도착 → 반대쪽 점. 멈춘 뒤 출발 (0초여도 다음 프레임: 이동 끝 알림 안에서 새 이동을 걸지 않는다)
+	SweepTargetIndex = 1 - SweepTargetIndex;
+	if (UWorld* World = GetWorld())
+	{
+		if (SweepWaitSeconds > 0.f)
+		{
+			World->GetTimerManager().SetTimer(SweepWaitTimer, this, &ThisClass::MoveToNextSweepPoint, SweepWaitSeconds, false);
+		}
+		else
+		{
+			SweepWaitTimer = World->GetTimerManager().SetTimerForNextTick(this, &ThisClass::MoveToNextSweepPoint);
+		}
+	}
+}
+
+void ULOACheatManager::StopBossSweep(const TCHAR* Reason)
+{
+	ALOAMonsterAIController* BossController = SweepController.Get();
+	const bool bWasSweeping = SweepController.IsValid();
+
+	if (BossController)
+	{
+		BossController->ReceiveMoveCompleted.RemoveDynamic(this, &ThisClass::OnSweepMoveCompleted);
+	}
+	SweepController.Reset();
+
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(SweepWaitTimer);
+	}
+
+	if (bWasSweeping)
+	{
+		LOA_LOG(this, Display, TEXT("[Cheat] Boss sweep ended (%s)."), Reason);
+	}
 }
 
 void ULOACheatManager::LOABossHeal()
@@ -248,7 +412,7 @@ void ULOACheatManager::LOABossHeal()
 	}
 
 	// 죽은 보스는 살리지 않는다. (사망 처리 GA·충돌·AI가 이미 끝난 상태)
-	if (ASC->HasMatchingGameplayTag(LOAGameplayTags::State_Dead))
+	if (ASC->HasMatchingGameplayTag(LOAGameplayTags::State_Body_Dead))
 	{
 		LOA_LOG(this, Warning, TEXT("[Cheat] The boss is dead. Restart PIE to test again."));
 		return;
@@ -258,6 +422,133 @@ void ULOACheatManager::LOABossHeal()
 	const float MaxHealth = ASC->GetNumericAttribute(ULOAAttributeSet_Common::GetMaxHealthAttribute());
 	ASC->SetNumericAttributeBase(ULOAAttributeSet_Common::GetHealthAttribute(), MaxHealth);
 	LOA_LOG(this, Display, TEXT("[Cheat] %s restored the boss health to %.0f"), *GetNameSafe(GetOuterAPlayerController()), MaxHealth);
+}
+
+void ULOACheatManager::LOABossHealth(float Percent)
+{
+	// 1% 아래는 1%로: 0이면 체력 0 = 죽음 처리가 아니라 값만 0이 되어 이상한 상태가 된다 (LOABossHeal처럼 GE 없이 값만 바꿈)
+	const float Clamped = FMath::Clamp(Percent, 1.f, 100.f);
+	if (ForwardToServer(FString::Printf(TEXT("LOABossHealth %.2f"), Clamped)))
+	{
+		return;
+	}
+
+	ALOABossCharacter* Boss = LOACheat::FindBoss(this);
+	UAbilitySystemComponent* ASC = Boss ? Boss->GetAbilitySystemComponent() : nullptr;
+	if (!ASC)
+	{
+		LOA_LOG(this, Warning, TEXT("[Cheat] No boss in this level."));
+		return;
+	}
+
+	if (ASC->HasMatchingGameplayTag(LOAGameplayTags::State_Body_Dead))
+	{
+		LOA_LOG(this, Warning, TEXT("[Cheat] The boss is dead. Restart PIE to test again."));
+		return;
+	}
+
+	// 예) 최대 100,000, 39% → 39,000. 테스트 도구라 LOABossHeal처럼 기본값을 바로 바꾼다 (복제·체력바 알림은 스탯창이 평소처럼)
+	const float MaxHealth = ASC->GetNumericAttribute(ULOAAttributeSet_Common::GetMaxHealthAttribute());
+	const float NewHealth = MaxHealth * Clamped / 100.f;
+	ASC->SetNumericAttributeBase(ULOAAttributeSet_Common::GetHealthAttribute(), NewHealth);
+	LOA_LOG(this, Display, TEXT("[Cheat] %s set the boss health to %.0f (%.1f%%)"), *GetNameSafe(GetOuterAPlayerController()), NewHealth, Clamped);
+}
+
+void ULOACheatManager::LOABossStagger(const FString& Amount)
+{
+	if (ForwardToServer(FString::Printf(TEXT("LOABossStagger %s"), *Amount)))
+	{
+		return;
+	}
+
+	ALOABossCharacter* Boss = LOACheat::FindBoss(this);
+	UAbilitySystemComponent* BossASC = Boss ? Boss->GetAbilitySystemComponent() : nullptr;
+	if (!BossASC)
+	{
+		LOA_LOG(this, Warning, TEXT("[Cheat] No boss in this level."));
+		return;
+	}
+
+	if (!BossASC->HasAttributeSetForAttribute(ULOAAttributeSet_Boss::GetStaggerAttribute()))
+	{
+		LOA_LOG(this, Warning, TEXT("[Cheat] The boss has no stagger gauge (LOAAttributeSet_Boss is not in its ability data set)."));
+		return;
+	}
+
+	// Refill = 다시 가득 (전멸·대난투 끝과 같은 함수)
+	if (Amount.Equals(TEXT("Refill"), ESearchCase::IgnoreCase))
+	{
+		Boss->RefillStagger();
+		return;
+	}
+
+	// 빈칸 = 남은 만큼 전부. 예) 남은 70 → 70 깎음 → 0 → Event.Trigger.StaggerBroken → 대난투
+	const float Remaining = BossASC->GetNumericAttribute(ULOAAttributeSet_Boss::GetStaggerAttribute());
+	const float StaggerAmount = Amount.IsEmpty() ? Remaining : FCString::Atof(*Amount);
+	if (StaggerAmount <= 0.f)
+	{
+		LOA_LOG(this, Warning, TEXT("[Cheat] Nothing to break (remaining %.1f, amount '%s'). Use LOABossStagger Refill first."), Remaining, *Amount);
+		return;
+	}
+
+	// 스킬과 같은 길: 명령을 친 플레이어가 보스에게 무력화 GE를 건다 (마지막으로 깎은 사람 = 이 플레이어)
+	APlayerController* PC = GetOuterAPlayerController();
+	UAbilitySystemComponent* SourceASC = UAbilitySystemGlobals::GetAbilitySystemComponentFromActor(PC ? PC->GetPawn() : nullptr);
+	if (!SourceASC)
+	{
+		SourceASC = BossASC;	// 몸이 없으면 (관전 등) 보스가 자기에게
+	}
+
+	FGameplayEffectSpecHandle SpecHandle = SourceASC->MakeOutgoingSpec(ULOAGE_Stagger::StaticClass(), 1.f, SourceASC->MakeEffectContext());
+	if (!SpecHandle.IsValid())
+	{
+		return;
+	}
+	SpecHandle.Data->SetSetByCallerMagnitude(LOAGameplayTags::SetByCaller_Stagger, StaggerAmount);
+	SourceASC->ApplyGameplayEffectSpecToTarget(*SpecHandle.Data, BossASC);
+
+	LOA_LOG(this, Display, TEXT("[Cheat] %s staggered the boss by %.1f (remaining was %.1f)"), *GetNameSafe(PC), StaggerAmount, Remaining);
+}
+
+void ULOACheatManager::LOATerrainCollapse(const FString& Side)
+{
+	if (ForwardToServer(FString::Printf(TEXT("LOATerrainCollapse %s"), *Side)))
+	{
+		return;
+	}
+
+	ULOARaidSubsystem* Raid = ULOARaidSubsystem::Get(this);
+	if (!Raid)
+	{
+		return;
+	}
+
+	bool bDone = false;
+	if (Side.IsEmpty())
+	{
+		bDone = Raid->RequestTerrainCollapse();
+	}
+	else if (Side.Equals(TEXT("Left"), ESearchCase::IgnoreCase))
+	{
+		bDone = Raid->RequestTerrainCollapse(ELOATerrainSide::Left);
+	}
+	else if (Side.Equals(TEXT("Right"), ESearchCase::IgnoreCase))
+	{
+		bDone = Raid->RequestTerrainCollapse(ELOATerrainSide::Right);
+	}
+	else if (Side.Equals(TEXT("Reset"), ESearchCase::IgnoreCase))
+	{
+		Raid->ResetTerrain();
+		bDone = true;
+	}
+	else
+	{
+		LOA_LOG(this, Warning, TEXT("[Cheat] LOATerrainCollapse: unknown side '%s'. Use Left, Right, Reset or nothing."), *Side);
+		return;
+	}
+
+	LOA_LOG(this, Display, TEXT("[Cheat] %s LOATerrainCollapse %s : %s"),
+		*GetNameSafe(GetOuterAPlayerController()), *Side, bDone ? TEXT("done") : TEXT("nothing to do"));
 }
 
 void ULOACheatManager::LOASlomo(float TimeDilation)

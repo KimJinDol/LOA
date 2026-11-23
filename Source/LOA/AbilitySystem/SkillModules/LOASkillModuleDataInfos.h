@@ -44,6 +44,7 @@
 
 class UAbilitySystemComponent;
 class UGameplayEffect;
+class UGameplayAbility;
 
 // =============================================================================
 // 누가 썼나 / 누가 맞았나
@@ -102,6 +103,14 @@ struct FLOASkillModuleContext
 	UPROPERTY(BlueprintReadWrite, Category = "LOA|Skill")
 	FGameplayTagContainer AttackTags;
 
+	/**
+	 * 이 효과를 보낸 스킬 (GA 인스턴스). ApplyPayload가 GE의 Effect Context에 적는다 (FGameplayEffectContext::SetAbility). (2026-11-07)
+	 * 쓰는 곳: 보호막 덮어쓰기 (ULOAGEComponent_ShieldOverride) — "같은 힐러가 같은 스킬로 건 보호막"을 찾을 때
+	 * 비어 있으면(GA가 아닌 곳에서 만든 상자) 스킬을 모르는 효과로 간다
+	 */
+	UPROPERTY(BlueprintReadWrite, Category = "LOA|Skill")
+	TObjectPtr<UGameplayAbility> SourceAbility = nullptr;
+
 	/** 상자가 쓸 수 있는 상태인가 (ASC, 범위 기준 액터, 시전자가 모두 있음) */
 	bool IsValid() const { return SourceASC != nullptr && SourceActor != nullptr && Caster != nullptr; }
 };
@@ -126,6 +135,32 @@ struct FLOATargetHit
 	/** 맞은 지점 (bHasHitPoint일 때만 의미 있음) */
 	UPROPERTY(BlueprintReadWrite, Category = "LOA|Skill")
 	FHitResult HitResult;
+
+	// ---------- 공격 판정 기록(FLOAAttackJudgeRecord)을 정할 자리·시각 (2026-11-02, 시각 11-03) ----------
+	// 비어 있으면(false) ApplyPayload가 지금 자리(때린 사람·맞은 쪽 액터 위치, 맞은 쪽 방향)·지금 시각으로 정한다. (보스 장판, 리슨 호스트 공격 등)
+	// 공격자 판정(ULOAAttackJudgeSubsystem::JudgeReport)이 채운다: 때린 사람 = 보고한 내 자리, 맞은 쪽 = 내 화면에서 본 시각으로 되감은 자리·방향, 시각 = 내 화면이 보여 주던 서버 시각
+	//   예) 내 화면에서는 보스 등 뒤였는데 그사이 서버의 보스가 30° 돌았다 → 되감은 방향으로 보면 "뒤" → 백 어택
+	//   예) 내 화면에서는 파란 구간이었는데 도착했을 때 서버는 구간이 닫혔다 → 내 화면의 시각으로 보면 구간 안 → 카운터
+
+	/** 아래 칸들이 채워져 있나 */
+	UPROPERTY(BlueprintReadWrite, Category = "LOA|Skill")
+	bool bHasDirectionBasis = false;
+
+	/** 때린 사람 위치 */
+	UPROPERTY(BlueprintReadWrite, Category = "LOA|Skill")
+	FVector AttackerLocation = FVector::ZeroVector;
+
+	/** 맞은 쪽 위치 */
+	UPROPERTY(BlueprintReadWrite, Category = "LOA|Skill")
+	FVector TargetLocation = FVector::ZeroVector;
+
+	/** 맞은 쪽이 보는 방향 (도) */
+	UPROPERTY(BlueprintReadWrite, Category = "LOA|Skill")
+	float TargetYaw = 0.f;
+
+	/** 판정 기준 서버 시각 (초). 공격자 판정 = 보고의 내 화면 서버 시각 (ViewServerTime, 한도로 자름) (2026-11-03) */
+	UPROPERTY(BlueprintReadWrite, Category = "LOA|Skill")
+	double AttackJudgeServerTime = 0.0;
 };
 
 // =============================================================================

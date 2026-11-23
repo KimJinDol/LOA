@@ -39,11 +39,11 @@ void ULOADeathReactionComponent::InitializeWithAbilitySystem(UAbilitySystemCompo
 	BoundASC = InASC;
 
 	// NewOrRemoved: 개수가 0 → 1 이상(붙음), 1 이상 → 0(떨어짐)일 때만 부른다. (2 → 3 같은 변화는 무시)
-	DeadTagChangedHandle = InASC->RegisterGameplayTagEvent(LOAGameplayTags::State_Dead, EGameplayTagEventType::NewOrRemoved)
+	DeadTagChangedHandle = InASC->RegisterGameplayTagEvent(LOAGameplayTags::State_Body_Dead, EGameplayTagEventType::NewOrRemoved)
 		.AddUObject(this, &ThisClass::OnDeadTagChanged);
 
 	// 늦게 들어온 플레이어: 보스가 이미 죽은 상태로 복제되어 왔으면 구독 시점엔 알림이 다시 오지 않는다. → 지금 확인
-	if (InASC->HasMatchingGameplayTag(LOAGameplayTags::State_Dead))
+	if (InASC->HasMatchingGameplayTag(LOAGameplayTags::State_Body_Dead))
 	{
 		HandleDied();
 	}
@@ -53,7 +53,7 @@ void ULOADeathReactionComponent::UninitializeFromAbilitySystem()
 {
 	if (UAbilitySystemComponent* ASC = BoundASC.Get())
 	{
-		ASC->UnregisterGameplayTagEvent(DeadTagChangedHandle, LOAGameplayTags::State_Dead, EGameplayTagEventType::NewOrRemoved);
+		ASC->UnregisterGameplayTagEvent(DeadTagChangedHandle, LOAGameplayTags::State_Body_Dead, EGameplayTagEventType::NewOrRemoved);
 	}
 
 	DeadTagChangedHandle.Reset();

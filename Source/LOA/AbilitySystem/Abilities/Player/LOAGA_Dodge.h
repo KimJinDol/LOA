@@ -3,7 +3,7 @@
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // [로아로 치면]
-// 스페이스바 이동기. 스킬을 쓰는 도중에도 언제든 눌러서 빠져나갈 수 있고,
+// 스페이스바 이동기. 스킬을 쓰는 도중에도 언제든 눌러서 빠져나갈 수 있고 (저스트 가드 중만 예외: 못 씀),
 // 회피 모션 동안 피격 이상·상태 이상에 면역이다. (데미지는 받는다. 후딜에서 끊으면 면역도 그 순간 해제)
 //
 // ─────────────────────────────────────────────────────────────────────────────
@@ -12,7 +12,7 @@
 //   스페이스 → 발동
 //      ├─ (발동 직전, GAS 자동) Cancel Abilities with Tag(BP: Ability)에 해당하는 실행 중 스킬 취소
 //      │     → 쓰던 스킬의 몽타주가 끊기고, 그 스킬이 붙였던 이동/행동 금지도 풀린다.
-//      ├─ (부모 ULOAPlayerAbility) 쿨타임 시작(Cooldown.Dodge) → 커서 쪽으로 회전
+//      ├─ (부모 ULOAPlayerAbility) 쿨타임 시작(Cooldown.Common.Dodge) → 커서 쪽으로 회전
 //      └─ StartSkill (이 클래스)
 //            ├─ 몽타주 재생 + 끝나면 종료 (다른 스킬과 같은 PlayMontageAndEnd)
 //            └─ [ApplyRootMotionConstantForce] DodgeDuration 동안 DodgeDistance만큼 밀기
@@ -35,7 +35,7 @@
 //
 // [면역 - Activation Owned Tags]
 // GAS 기본 기능: Ability가 실행 중인 동안 이 태그들을 ASC에 붙여 두고, 끝나면 GAS가 뗀다.
-// 생성자에서 State.Immune.Push / State.Immune.Debuff를 기본값으로 넣는다. (BP에서 바꿀 수 있음)
+// 생성자에서 State.Immune.Push / State.Immune.Status를 기본값으로 넣는다. (BP에서 바꿀 수 있음)
 // 로아 회피 규칙과 같다: 끊지 않으면 회피 모션 내내 면역, 후딜에서 이동/스킬로 끊으면 그 순간 해제.
 //   (Ability 종료 시점 = 몽타주 끝 또는 후딜 캔슬 → 기존 후딜 로직이 그대로 처리)
 // 서버에서도 Ability가 실행되므로 서버 ASC에 태그가 붙는다. (상태 이상은 서버가 걸기 때문에 이것으로 충분)
@@ -51,8 +51,8 @@
 // [BP에서 설정할 것] GA_Dodge (부모: LOAGA_Dodge)
 //   Montage                     = 회피 몽타주 (DefaultSlot)
 //                                   - 대시 끝: LOA Send Gameplay Event (Event.Montage.Unlock, Branching Point)
-//   Cooldown Duration / Tags    = 예: 8 / Cooldown.Dodge
-//   Asset Tags                  = Ability.Dodge
+//   Cooldown Duration / Tags    = 예: 8 / Cooldown.Common.Dodge
+//   Asset Tags                  = Ability.Common.Dodge    (생성자 기본값. 저스트 가드가 이 태그로 회피를 막는다)
 //   Cancel Abilities with Tag   = Ability          ← 이게 있어야 쓰던 스킬이 끊긴다
 //   Dodge Distance / Duration   = 예: 500 / 0.3
 

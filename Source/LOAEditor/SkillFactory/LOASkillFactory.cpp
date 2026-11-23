@@ -34,7 +34,7 @@ DEFINE_LOG_CATEGORY_STATIC(LogLOASkillFactory, Log, All);
 namespace LOASkillFactory
 {
 	/** 모든 스킬 폴더의 뿌리 */
-	static const TCHAR* SkillsRoot = TEXT("/Game/LOA/Skills");
+	static const TCHAR* SkillsRoot = TEXT("/Game/LOA/AbilitySystem/GA/Player");
 
 	/** 클래스 데이터 에셋 이름의 앞부분. 이걸 떼면 클래스 이름 (DA_Class_Berserker → Berserker) */
 	static const TCHAR* ClassDataPrefix = TEXT("DA_Class_");
@@ -222,7 +222,7 @@ TArray<FString> ULOASkillFactory::GetSkillParentClassNames()
 
 	// 이름 순으로 정렬한 뒤, 기본 스킬(LOAPlayerAbility)을 맨 앞으로 → 콤보 박스의 첫 항목 = 기본값
 	Names.Sort();
-	const FString BaseName = ULOAPlayerAbility::StaticClass()->GetName();
+	const FString BaseName = ULOAGameplayAbility::StaticClass()->GetName();
 	if (Names.Remove(BaseName) > 0)
 	{
 		Names.Insert(BaseName, 0);
@@ -237,7 +237,7 @@ bool ULOASkillFactory::IsSkillParentClass(const UClass* Class)
 	//   Deprecated / NewerVersionExists : 지워졌거나 핫리로드로 교체된 옛 클래스는 뺀다
 	// Abstract(UCLASS(Abstract))는 뺀다는 조건이 없다. → 우리 GA 부모들은 전부 Abstract라서 빼면 목록이 빈다.
 	return Class
-		&& Class->IsChildOf(ULOAPlayerAbility::StaticClass())
+		&& Class->IsChildOf(ULOAGameplayAbility::StaticClass())
 		&& Class->HasAnyClassFlags(CLASS_Native)
 		&& !Class->HasAnyClassFlags(CLASS_Deprecated | CLASS_NewerVersionExists);
 }

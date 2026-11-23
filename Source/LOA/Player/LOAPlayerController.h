@@ -10,6 +10,10 @@
 //   3) 마우스 커서: 탑쿼터뷰 게임이므로 커서를 항상 보이게 하고, 우클릭 중에도 숨기지 않는다
 //   4) HUD 초기화 : "캐릭터 준비 완료"와 "HUD 생성" 둘 다 확인되면 HUD에게 화면을 만들라고 한다
 //   5) 전투 RPC 컴포넌트(ULOACombatRPCComponent)를 붙여 둔다. 서버 ↔ 이 플레이어 사이의 전투 RPC는 컴포넌트가 전부 담당
+//   6) 부활 요청: 부활 버튼 → RequestRevive → ServerRequestRevive (서버가 공용 목숨 확인 → 캐릭터 부활)
+//   7) 관전 부품(ULOASpectateComponent)을 붙여 두고 본인 컴퓨터에서 켠다. (죽어 있는 동안 아군 카메라)
+//   8) 화면 전환(전멸 → 정비소, 정비소 → 전투 구역)의 검은 화면. 본인 컴퓨터에서 매 프레임 ALOAGameState의 어둡기를 읽어 카메라에 칠한다
+//      (GameState 복제가 PC보다 늦게 와도, 늦게 들어와도 순서 걱정이 없게 알림 구독 대신 매 프레임 읽기. 빼기 몇 번)
 //
 // [HUD 초기화 - 왜 여기서 하나]
 // PlayerController = "이 컴퓨터 앞에 앉은 사람". HUD도 이 사람 것이다. 그래서 둘을 잇는 일을 여기서 한다.
@@ -35,7 +39,7 @@
 // - PlayerController는 서버와 "그 플레이어 본인 컴퓨터"에만 존재한다. (다른 플레이어 컴퓨터에는 없음)
 // - 입력 처리는 본인 컴퓨터에서만 일어난다. 서버의 원격 플레이어용 PlayerController는 입력을 받지 않는다.
 // - 스킬 발동 요청을 서버로 보내는 일은 ASC(GAS)가, 이동 동기화는 CharacterMovementComponent가 담당한다.
-// - 이 클래스에 직접 만든 RPC는 디버그용 ServerCheat 하나뿐이다. (치트 매니저의 명령을 서버로 보냄, 개발 빌드만)
+// - 이 클래스에 직접 만든 RPC: 디버그용 ServerCheat · ClientCheat (개발 빌드만), 부활 요청 ServerRequestRevive.
 //   전투 RPC(데미지 숫자, 예고, 피해자 판정 보고 등)는 전투 RPC 컴포넌트가 가진다.
 
 #pragma once
@@ -51,6 +55,7 @@ class ULOAClickMoveComponent;
 class ULOACombatRPCComponent;
 class ULOAAbilitySystemComponent;
 class ALOACharacter;
+class ULOASpectateComponent;
 
 UCLASS()
 class LOA_API ALOAPlayerController : public APlayerController
@@ -65,6 +70,17 @@ public:
 
 	UFUNCTION(BlueprintPure, Category = "LOA|PlayerController")
 	ULOACombatRPCComponent* GetCombatRPCComponent() const { return CombatRPCComponent; }
+
+	UFUNCTION(BlueprintPure, Category = "LOA|PlayerController")
+	ULOASpectateComponent* GetSpectateComponent() const { return SpectateComponent; }
+
+	// ---------- 부활 ----------
+	/**
+	 * [본인 컴퓨터] 부활 버튼. 서버에 부활을 요청한다. 되는지는 서버가 정한다. (목숨이 없으면 아무 일 없음)
+	 * 위젯은 ULOAOverlayWidgetController::RequestRevive를 부른다 → 여기로 온다.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "LOA|Revive")
+	void RequestRevive();
 
 	//~ Begin AController Interface
 	/**
@@ -82,6 +98,9 @@ public:
 	 * 개발 빌드에서는 클라도 갖게 한다. (클라 창에서 LOABossPattern 등을 칠 수 있게. Lyra와 같은 방식) 출시 빌드는 엔진이 아예 안 만든다.
 	 */
 	virtual void AddCheats(bool bForce) override;
+
+	/** [본인 컴퓨터] 매 프레임. 화면 전환 어둡기를 카메라에 (UpdateTransferFade) */
+	virtual void PlayerTick(float DeltaTime) override;
 	//~ End APlayerController Interface
 
 	// ---------- 치트 (개발 빌드) ----------
@@ -93,6 +112,23 @@ public:
 	 */
 	UFUNCTION(Server, Reliable)
 	void ServerCheat(const FString& Command);
+
+	/**
+	 * [서버 → 이 플레이어 컴퓨터] 콘솔 명령을 그 플레이어 컴퓨터의 치트 매니저로 실행한다. ServerCheat의 반대 방향 (2026-11-04)
+	 * 그 플레이어 컴퓨터에서 해야 하는 치트에 쓴다. 예) 자동 저가: 저가 GA는 조종하는 사람 컴퓨터에서 발동한다
+	 * 예) 아무 창: LOAAutoGuard P2 0.3 → (서버) P2의 PC에 ClientCheat("LOAAutoGuardLocal 0.300") → P2 컴퓨터의 ULOAPlayerCheats
+	 * 출시 빌드에서는 아무것도 안 한다.
+	 */
+	UFUNCTION(Client, Reliable)
+	void ClientCheat(const FString& Command);
+
+	/**
+	 * [이 플레이어 컴퓨터 → 서버] 부활 요청.
+	 * 서버: 내 캐릭터가 죽어 있나 → 공용 목숨을 하나 쓸 수 있나(ALOAGameState) → 캐릭터 부활(ALOACharacter::ReviveFromDeath)
+	 * 둘이 동시에 눌러도 서버가 하나씩 처리하므로 목숨 1개면 먼저 도착한 쪽만 산다.
+	 */
+	UFUNCTION(Server, Reliable)
+	void ServerRequestRevive();
 
 protected:
 	//~ Begin AActor Interface
@@ -153,6 +189,17 @@ private:
 	 */
 	ULOAAbilitySystemComponent* GetReadyAbilitySystemComponent() const;
 
+	// ---------- 화면 전환 ----------
+	/**
+	 * [본인 컴퓨터] 어둡기 = 정비소 화면 전환(ALOAGameState::GetTransferFadeAlpha)과 대난투(ALOABrawlArena::GetFadeAlpha) 중 큰 쪽
+	 * 0보다 크면 카메라를 그만큼 검게 (SetManualCameraFade). 0으로 돌아오면 끈다 (StopCameraFade). 예) 시작 100.0, 지금 100.25 → 0.5 → 반쯤 검음
+	 * 대난투 줌인도 여기서: 내 캐릭터 카메라 거리 배율 (ALOABrawlArena::GetCameraZoomScale, 사용자 11-18: 줌인 대상 = 내 캐릭터)
+	 */
+	void UpdateTransferFade();
+
+	/** 지금 화면 전환 어둡기를 칠하고 있나 (끌 때 한 번만 끄려고) */
+	bool bTransferFadeActive = false;
+
 	// ---------- 컴포넌트 ----------
 	/** 우클릭 이동 부품. 설정값(IMC, 도착 반경 등)은 BP_LOAPlayerController의 컴포넌트 디테일에서 조정 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LOA|Input", meta = (AllowPrivateAccess = "true"))
@@ -161,6 +208,10 @@ private:
 	/** 전투 RPC 컴포넌트. 서버 ↔ 이 플레이어 사이의 전투 RPC 통로 (데미지 숫자, 예고, 피해자 판정 보고) */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LOA|CombatRPC", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<ULOACombatRPCComponent> CombatRPCComponent;
+
+	/** 관전 부품. 키·시간 설정은 BP_LOAPlayerController의 컴포넌트 디테일에서 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LOA|Spectate", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<ULOASpectateComponent> SpectateComponent;
 
 	// ---------- 데이터 (BP 기본값에서 지정) ----------
 	/** 입력 액션 ↔ InputTag 연결표 (프로젝트에 하나: DA_InputConfig_Default) */

@@ -21,9 +21,10 @@
 //
 //     LOA.Bench.HitJudge [반복 수] [반지름]     기본 1000번, 반지름 500
 //   내 캐릭터 위치에 원을 놓고(공격하는 쪽 = 나 → 허수아비·보스가 적), 같은 순간·같은 모양으로 두 방식을 각각 반복 수만큼 돌려 평균 시간을 잰다.
-//     Overlap : ULOACombatLibrary::FindTargetsInSphere (물리 엔진 겹침 검사 → ASC·살아 있음·Filter 확인) ← 지금 서버 판정
+//     Overlap : ULOACombatLibrary::FindTargetsInSphere (물리 엔진 상자 겹침 검사 → ASC·살아 있음·Filter·IsBodyInShape) ← 지금 서버 판정
 //     Math    : 후보 목록(레벨에서 ASC가 있는 액터 전부, 재기 전에 한 번 모음)을 돌며 IsTargetable·PassesFilter·IsBodyInShape (물리 엔진을 안 씀)
-//   두 방식이 찾은 수도 같이 찍는다. 다르면 비교가 공정하지 않다는 뜻 (예: 높이 차이가 큰 대상).
+//   두 방식이 찾은 수도 같이 찍는다. 다르면 비교가 공정하지 않다는 뜻 (예: 캡슐이 루트가 아닌 대상).
+//   (2026-11-01 판정 높이 이후 두 방식 모두 마지막에 같은 IsBodyInShape(바닥 모양 + 높이)를 거친다 → Overlap = 1차 거르기 비용 + Math)
 //   예) [Bench] 100 candidates, radius 500, 1000 runs | Overlap 4.12 us (hit 3) | Math 6.10 us (hit 3)   ← 숫자는 예시
 //   허수아비를 레벨에 복사해(Alt+드래그) 10 / 50 / 100개로 늘려 가며 잰다. 스탠드얼론으로 충분.
 //   Unreal Insights: Trace(cpu 채널) 켜고 명령을 치면 타임라인에 LOA_Bench_Overlap / LOA_Bench_Math 구간이 보인다.
@@ -45,6 +46,14 @@
 //   번호는 -1, -2, ... (진짜 판정 번호는 1부터) → 클라가 판정해 보고해도 서버는 "기다리는 번호 없음"으로 버린다. 게임에 영향 없음.
 //   Insights: 서버 타임라인의 LOA_Bench_RPCSend 구간 = 보내는 데 쓴 CPU, Networking Insights = RPC 한 개 크기·패킷 수.
 //   주의: 지금 RPC는 Reliable. 한 번에 너무 많이(약 250개 넘게) 보내면 대기열이 넘쳐 클라 연결이 끊길 수 있다.
+//
+// [LOA.Debug.ClockCheck]  (2026-10-29 디버그 측정) 클라 창에서 친다. 내 시계(LOANetTime)가 실제 서버 시각과 얼마나 다른가
+//
+//     LOA.Debug.ClockCheck [횟수]     기본 10 (0.2초 간격)
+//   서버에 "지금 내 실제 시각"을 보내고, 서버가 자기 시각을 붙여 돌려준다 → 왕복 시간과 시계 오차를 Output Log에
+//   예) [ClockCheck] RTT 0.430 (PlayerState ping 428ms) | LOANetTime error -0.025 | engine clock error -0.240 | my one-way 0.214 vs RTT/2 0.215
+//     LOANetTime error : + = 내 시계가 앞섬 / − = 늦음. 예고 앞당김이 이만큼 덜(−) 된다
+//     짐작 오차: 서버가 받은 프레임을 처리하는 시간까지 왕복에 들어 있어 ± 한 프레임 정도
 //
 // [네트워크]
 //   패턴 발동과 AI 멈춤은 서버에서만 할 수 있다. 이 명령은 명령을 친 컴퓨터에서 실행되므로
@@ -82,6 +91,7 @@
 #include "HAL/PlatformTime.h"
 #include "EngineUtils.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
+#include "TimerManager.h"
 
 namespace LOADebugCommands
 {
@@ -221,6 +231,7 @@ namespace LOADebugCommands
 		{
 			const AActor* Actor = nullptr;
 			float BodyRadius = 0.f;
+			float BodyHalfHeight = 0.f;
 		};
 		TArray<FBenchCandidate> Candidates;
 		for (TActorIterator<AActor> It(World); It; ++It)
@@ -228,7 +239,7 @@ namespace LOADebugCommands
 			if (UAbilitySystemGlobals::GetAbilitySystemComponentFromActor(*It))
 			{
 				const UCapsuleComponent* Capsule = Cast<UCapsuleComponent>(It->GetRootComponent());
-				Candidates.Add({ *It, Capsule ? Capsule->GetScaledCapsuleRadius() : 0.f });
+				Candidates.Add({ *It, Capsule ? Capsule->GetScaledCapsuleRadius() : 0.f, Capsule ? Capsule->GetScaledCapsuleHalfHeight() : 0.f });
 			}
 		}
 
@@ -264,7 +275,7 @@ namespace LOADebugCommands
 						continue;
 					}
 
-					if (ULOACombatLibrary::IsBodyInShape(Shape, Center, Yaw, Candidate.Actor->GetActorLocation(), Candidate.BodyRadius))
+					if (ULOACombatLibrary::IsBodyInShape(Shape, Center, Yaw, Candidate.Actor->GetActorLocation(), Candidate.BodyRadius, Candidate.BodyHalfHeight))
 					{
 						++MathHits;
 					}
@@ -275,7 +286,7 @@ namespace LOADebugCommands
 
 		UE_LOG(LogLOA, Display, TEXT("[Bench] %d candidates, radius %.0f, %d runs | Overlap %.2f us (hit %d) | Math %.2f us (hit %d)%s"),
 			Candidates.Num(), Radius, Runs, OverlapUs, OverlapHits, MathUs, MathHits,
-			OverlapHits != MathHits ? TEXT(" | hit counts differ (height or non-character targets?)") : TEXT(""));
+			OverlapHits != MathHits ? TEXT(" | hit counts differ (non-capsule targets?)") : TEXT(""));
 	}
 
 	/** 피해자 판정 RPC 대상 수 세기 (지금 규칙 vs 근처만). 실제 RPC는 보내지 않는다. */
@@ -324,11 +335,12 @@ namespace LOADebugCommands
 
 			const UCapsuleComponent* Capsule = Cast<UCapsuleComponent>(Candidate->GetRootComponent());
 			const float BodyRadius = Capsule ? Capsule->GetScaledCapsuleRadius() : 0.f;
+			const float BodyHalfHeight = Capsule ? Capsule->GetScaledCapsuleHalfHeight() : 0.f;
 			const FVector Location = Candidate->GetActorLocation();
 
 			++NumFakePlayers;
-			NumInShape += ULOACombatLibrary::IsBodyInShape(Shape, Center, Yaw, Location, BodyRadius) ? 1 : 0;
-			NumAskA += ULOACombatLibrary::IsBodyInShape(ShapeWithMargin, Center, Yaw, Location, BodyRadius) ? 1 : 0;
+			NumInShape += ULOACombatLibrary::IsBodyInShape(Shape, Center, Yaw, Location, BodyRadius, BodyHalfHeight) ? 1 : 0;
+			NumAskA += ULOACombatLibrary::IsBodyInShape(ShapeWithMargin, Center, Yaw, Location, BodyRadius, BodyHalfHeight) ? 1 : 0;
 		}
 
 		UE_LOG(LogLOA, Display, TEXT("[BenchRPC] %d fake players, radius %.0f, margin %.0f | in shape %d | Now: ask %d (%d RPC) | A: ask %d (%d RPC)"),
@@ -383,8 +395,13 @@ namespace LOADebugCommands
 			TRACE_CPUPROFILER_EVENT_SCOPE(LOA_Bench_RPCSend);
 			for (int32 Index = 1; Index <= Count; ++Index)
 			{
-				// bJudgeOnArrival = true → 클라가 기다리지 않고 바로 판정해 보고
-				TargetRPC->ClientRequestHitJudge(-Index, Shape, Center, 0.f, Now, true);
+				// 클라가 받은 순간 바로 판정해 보고
+				FLOAHitJudgeRequestData Request;
+				Request.RequestId = -Index;
+				Request.Shape = Shape;
+				Request.ShapeCenter = Center;
+				Request.HitServerTime = Now;
+				TargetRPC->ClientRequestHitJudge(Request);
 			}
 		}
 		const double SendUs = (FPlatformTime::Seconds() - StartSeconds) * 1e6;
@@ -392,6 +409,46 @@ namespace LOADebugCommands
 		UE_LOG(LogLOA, Display, TEXT("[BenchRPCStress] sent %d fake judge requests to %s | send %.1f us total, %.2f us each (reports will be ignored)"),
 			Count, *GetNameSafe(TargetPC), SendUs, SendUs / Count);
 	}
+
+	static void ClockCheck(const TArray<FString>& Args, UWorld* World)
+	{
+		APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+		ULOACombatRPCComponent* CombatRPC = PC ? PC->FindComponentByClass<ULOACombatRPCComponent>() : nullptr;
+		if (!CombatRPC || World->GetNetMode() != NM_Client)
+		{
+			UE_LOG(LogLOA, Warning, TEXT("[ClockCheck] Run this in a client window (needs a combat RPC component)."));
+			return;
+		}
+
+		const int32 Count = Args.Num() > 0 ? FMath::Clamp(FCString::Atoi(*Args[0]), 1, 100) : 10;
+
+		// 0.2초 간격으로 Count번 (한꺼번에 보내면 같은 프레임에 처리돼 표본이 겹친다)
+		TSharedRef<int32> Remaining = MakeShared<int32>(Count);
+		TSharedRef<FTimerHandle> Handle = MakeShared<FTimerHandle>();
+		TWeakObjectPtr<ULOACombatRPCComponent> WeakRPC = CombatRPC;
+		TWeakObjectPtr<UWorld> WeakWorld = World;
+		World->GetTimerManager().SetTimer(*Handle, FTimerDelegate::CreateLambda([Remaining, Handle, WeakRPC, WeakWorld]()
+		{
+			if (ULOACombatRPCComponent* RPC = WeakRPC.Get())
+			{
+				RPC->ServerDebugClockPing(FPlatformTime::Seconds());
+			}
+			if (--(*Remaining) <= 0 || !WeakRPC.IsValid())
+			{
+				if (UWorld* W = WeakWorld.Get())
+				{
+					W->GetTimerManager().ClearTimer(*Handle);
+				}
+			}
+		}), 0.2f, true, 0.f);
+
+		UE_LOG(LogLOA, Display, TEXT("[ClockCheck] sending %d pings (0.2s apart)"), Count);
+	}
+
+	static FAutoConsoleCommandWithWorldAndArgs ClockCheckCommand(
+		TEXT("LOA.Debug.ClockCheck"),
+		TEXT("(Client) Measure LOANetTime error vs the real server time with ping-pong RPCs. Usage: LOA.Debug.ClockCheck [count=10]"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&ClockCheck));
 
 	static FAutoConsoleCommandWithWorldAndArgs BossAICommand(
 		TEXT("LOA.Boss.AI"),

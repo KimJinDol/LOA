@@ -3,7 +3,7 @@
 #include "Player/LOAPlayerState.h"
 #include "AbilitySystem/LOAAbilitySystemComponent.h"
 #include "AbilitySystem/Attributes/LOAAttributeSet_Common.h"
-#include "AbilitySystem/Attributes/LOAAttributeSet_Mana.h"
+#include "AbilitySystem/Attributes/LOAAttributeSet_Player.h"
 #include "AbilitySystem/Attributes/LOAAttributeSet_Combat.h"
 #include "Data/LOACharacterClassData.h"
 #include "Data/LOAAbilityDataSet.h"
@@ -27,10 +27,11 @@ ALOAPlayerState::ALOAPlayerState(const FObjectInitializer& ObjectInitializer)
 	// (별도로 "등록" 코드를 쓸 필요 없음)
 	CommonAttributeSet = CreateDefaultSubobject<ULOAAttributeSet_Common>(TEXT("CommonAttributeSet"));
 
-	// ---------- 마나 스탯창 ----------
-	// 모든 직업이 마나를 쓰므로 Common과 같은 방식으로 기본으로 만든다. (ASC가 하위 객체로 자동 등록)
-	// Common에서 분리한 이유: 보스/허수아비는 마나가 없다. (LOAAttributeSet_Common.h [스탯창 나누는 기준])
-	ManaAttributeSet = CreateDefaultSubobject<ULOAAttributeSet_Mana>(TEXT("ManaAttributeSet"));
+	// ---------- 플레이어 스탯창 (마나, 낙인력) ----------
+	// 모든 직업이 가지므로 Common과 같은 방식으로 기본으로 만든다. (ASC가 하위 객체로 자동 등록)
+	// Common에서 분리한 이유: 보스/허수아비는 마나·낙인력이 없다. (LOAAttributeSet_Common.h [스탯창 나누는 기준])
+	// (2026-11-07) 옛 ULOAAttributeSet_Mana / ManaAttributeSet. 하위 객체 이름도 바꿨다 (DefaultEngine.ini 리다이렉트)
+	PlayerAttributeSet = CreateDefaultSubobject<ULOAAttributeSet_Player>(TEXT("PlayerAttributeSet"));
 
 	// ---------- 전투 스탯창 ----------
 	// 모든 직업이 공격하므로 Common과 같은 방식으로 기본으로 만든다. (ASC가 하위 객체로 자동 등록)

@@ -8,6 +8,8 @@
 #include "AbilitySystem/SkillModules/LOASkillModule.h"
 #include "Core/LOAGameplayTags.h"
 #include "Core/LOALog.h"
+#include "Character/Player/LOACharacter.h"
+#include "Data/LOACharacterClassData.h"
 
 #include "Abilities/Tasks/AbilityTask_PlayMontageAndWait.h"
 
@@ -18,6 +20,9 @@
 #include "Animation/AnimInstance.h"
 #include "Animation/LOAAnimNotify_SendGameplayEvent.h"
 #include "GameFramework/Actor.h"
+#include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "AIController.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(LOAGameplayAbility)
 
@@ -35,7 +40,7 @@ ULOAGameplayAbility::ULOAGameplayAbility(const FObjectInitializer& ObjectInitial
 	// 죽어 있는 동안에는 어떤 Ability도 발동하지 않는다. (플레이어 스킬, 보스 패턴 모두)
 	// 예외는 사망 Ability 자신뿐이다. (ULOAGA_Death 생성자에서 뺀다)
 	// State.Dead는 GE로 붙어 모든 컴퓨터에 복제되므로, 클라이언트의 예측 발동도 여기서 막힌다.
-	ActivationBlockedTags.AddTag(LOAGameplayTags::State_Dead);
+	ActivationBlockedTags.AddTag(LOAGameplayTags::State_Body_Dead);
 }
 
 // =============================================================================
@@ -109,13 +114,70 @@ FActiveGameplayEffectHandle ULOAGameplayAbility::ApplyStateTagsToSelf(const FGam
 	return ApplyGameplayEffectSpecToOwner(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo, SpecHandle);
 }
 
+void ULOAGameplayAbility::StopAvatarMovement() const
+{
+	const ACharacter* Character = Cast<ACharacter>(GetAvatarActorFromActorInfo());
+	if (!Character)
+	{
+		return;
+	}
+
+	// 몬스터·보스: AI 길 찾기를 멈춘다. (안 멈추면 이동 컴포넌트를 세워도 다음 틱에 다시 걸어간다)
+	if (AAIController* AIController = Cast<AAIController>(Character->GetController()))
+	{
+		AIController->StopMovement();
+	}
+
+	Character->GetCharacterMovement()->StopMovementImmediately();
+}
+
 // =============================================================================
 // 몽타주
 // =============================================================================
 
+bool ULOAGameplayAbility::PlayMontageOnly()
+{
+	UAnimMontage* MontageToPlay = GetMontage();
+	if (!MontageToPlay)
+	{
+		return false;
+	}
+
+	// bStopWhenAbilityEnds = true: Ability가 끝나면 몽타주도 빠진다. 몽타주 끝 알림은 받지 않는다 (끝은 다른 것이 정함)
+	UAbilityTask_PlayMontageAndWait* MontageTask = UAbilityTask_PlayMontageAndWait::CreatePlayMontageAndWaitProxy(
+		this, NAME_None, MontageToPlay, MontagePlayRate, NAME_None, /*bStopWhenAbilityEnds*/ true);
+	MontageTask->ReadyForActivation();
+	return true;
+}
+
+UAnimMontage* ULOAGameplayAbility::GetMontage() const
+{
+	// GetAvatarActorFromActorInfo는 원본(CDO)에서 부르면 엔진 경고(ensure)가 난다 → 멤버를 직접 본다
+	const AActor* Avatar = CurrentActorInfo ? CurrentActorInfo->AvatarActor.Get() : nullptr;
+	return GetMontageFor(Avatar);
+}
+
+UAnimMontage* ULOAGameplayAbility::GetMontageFor(const AActor* Avatar) const
+{
+	// ① 시전자 직업 표. 플레이어 캐릭터만 직업 데이터가 있다 (보스·잡몹은 Cast 실패 → ②)
+	if (MontageTag.IsValid())
+	{
+		const ALOACharacter* Character = Cast<ALOACharacter>(Avatar);
+		const ULOACharacterClassData* ClassData = Character ? Character->GetCharacterClassData() : nullptr;
+		if (UAnimMontage* ClassMontage = ClassData ? ClassData->FindMontage(MontageTag) : nullptr)
+		{
+			return ClassMontage;
+		}
+	}
+
+	// ② 이 GA의 기본 몽타주
+	return Montage;
+}
+
 bool ULOAGameplayAbility::GetTimeUntilMontageEvent(const FGameplayTag& EventTag, float& OutSeconds) const
 {
-	if (!Montage)
+	const UAnimMontage* MontageToPlay = GetMontage();
+	if (!MontageToPlay)
 	{
 		return false;
 	}
@@ -125,21 +187,21 @@ bool ULOAGameplayAbility::GetTimeUntilMontageEvent(const FGameplayTag& EventTag,
 	const FGameplayAbilityActorInfo* Info = GetCurrentActorInfo();
 	if (const UAnimInstance* AnimInstance = Info ? Info->GetAnimInstance() : nullptr)
 	{
-		if (AnimInstance->Montage_IsPlaying(Montage))
+		if (AnimInstance->Montage_IsPlaying(MontageToPlay))
 		{
-			CurrentPosition = AnimInstance->Montage_GetPosition(Montage);
+			CurrentPosition = AnimInstance->Montage_GetPosition(MontageToPlay);
 		}
 	}
 
 	// 지금 이후 가장 이른 그 노티파이 (몽타주 타임라인 기준 초)
 	float EventTime = 0.f;
-	if (!ULOAAnimNotify_SendGameplayEvent::FindEventTimeInMontage(Montage, EventTag, CurrentPosition, EventTime))
+	if (!ULOAAnimNotify_SendGameplayEvent::FindEventTimeInMontage(MontageToPlay, EventTag, CurrentPosition, EventTime))
 	{
 		return false;
 	}
 
 	// 실제 재생 속도 = GA의 재생 속도 × 몽타주 에셋 자체의 Rate Scale
-	const float EffectiveRate = MontagePlayRate * Montage->RateScale;
+	const float EffectiveRate = MontagePlayRate * MontageToPlay->RateScale;
 	if (EffectiveRate <= KINDA_SMALL_NUMBER)
 	{
 		return false;
@@ -151,7 +213,8 @@ bool ULOAGameplayAbility::GetTimeUntilMontageEvent(const FGameplayTag& EventTag,
 
 bool ULOAGameplayAbility::PlayMontageAndEnd()
 {
-	if (!Montage)
+	UAnimMontage* MontageToPlay = GetMontage();
+	if (!MontageToPlay)
 	{
 		return false;
 	}
@@ -159,7 +222,7 @@ bool ULOAGameplayAbility::PlayMontageAndEnd()
 	// ASC를 통해 재생되므로 다른 플레이어 화면에도 자동으로 복제된다.
 	// bStopWhenAbilityEnds(기본 true): Ability가 먼저 끝나면(취소 등) 몽타주도 멈춘다.
 	UAbilityTask_PlayMontageAndWait* MontageTask =
-		UAbilityTask_PlayMontageAndWait::CreatePlayMontageAndWaitProxy(this, NAME_None, Montage, MontagePlayRate);
+		UAbilityTask_PlayMontageAndWait::CreatePlayMontageAndWaitProxy(this, NAME_None, MontageToPlay, MontagePlayRate);
 
 	// BlendOut: 몽타주가 끝나기 시작하는 순간(섞이며 빠지는 중).
 	//   여기서 종료하면 다음 입력을 조금 더 빨리 받을 수 있어서 조작감이 좋다.
@@ -208,8 +271,9 @@ void ULOAGameplayAbility::ApplyCooldown(
 	const FGameplayAbilityActorInfo* ActorInfo,
 	const FGameplayAbilityActivationInfo ActivationInfo) const
 {
-	// 쿨타임 없는 Ability (평타, 피격 반응 등)
-	if (CooldownDuration <= 0.f)
+	// 쿨타임 없는 Ability (평타, 피격 반응 등). 커브 테이블 행이면 스킬 레벨의 값
+	const float Duration = CooldownDuration.GetValueAtLevel(GetAbilityLevel(Handle, ActorInfo));
+	if (Duration <= 0.f)
 	{
 		return;
 	}
@@ -218,7 +282,7 @@ void ULOAGameplayAbility::ApplyCooldown(
 	if (CooldownTags.IsEmpty())
 	{
 		LOA_LOG(ActorInfo ? ActorInfo->AvatarActor.Get() : nullptr, Warning,
-			TEXT("[%s] CooldownDuration is %.1f but CooldownTags is empty. No cooldown."), *GetNameSafe(GetClass()), CooldownDuration);
+			TEXT("[%s] CooldownDuration is %.1f but CooldownTags is empty. No cooldown."), *GetNameSafe(GetClass()), Duration);
 		return;
 	}
 
@@ -233,7 +297,7 @@ void ULOAGameplayAbility::ApplyCooldown(
 	// ② 이 Ability의 값 넣기
 	//    시간 : GE의 Duration이 SetByCaller.Cooldown을 읽는다.
 	//    태그 : GE에 없던 태그를 이번 적용에만 추가로 부여한다. GE가 붙어 있는 동안 ASC가 이 태그를 가진다.
-	SpecHandle.Data->SetSetByCallerMagnitude(LOAGameplayTags::SetByCaller_Cooldown, CooldownDuration);
+	SpecHandle.Data->SetSetByCallerMagnitude(LOAGameplayTags::SetByCaller_Cooldown, Duration);
 	SpecHandle.Data->DynamicGrantedTags.AppendTags(CooldownTags);
 
 	// ③ 나에게 적용. 조종하는 사람 컴퓨터에서는 예측으로 적용되고, 서버가 확인하면 그대로 유지된다.
@@ -316,6 +380,19 @@ void ULOAGameplayAbility::EndAbility(
 // 모듈 창구
 // =============================================================================
 
+int32 ULOAGameplayAbility::GetSkillModuleIndex(const ULOASkillModule* Module) const
+{
+	// GA 에셋의 칸 순서 (내 컴퓨터와 서버가 같다)
+	for (int32 Index = 0; Index < Modules.Num(); ++Index)
+	{
+		if (Modules[Index] == Module)
+		{
+			return Index;
+		}
+	}
+	return INDEX_NONE;
+}
+
 bool ULOAGameplayAbility::HasSkillModuleAuthority() const
 {
 	// 서버(데디케이티드, 리슨 호스트, 스탠드얼론)면 true. 클라이언트의 예측 실행이면 false.
@@ -332,6 +409,8 @@ FLOASkillModuleContext ULOAGameplayAbility::MakeSkillModuleContext() const
 	Context.ChargeMultiplier = GetChargeMultiplier();
 	// 공격 속성: Asset Tags 중 Skill.Attribute 아래 태그만. 예) { Skill.Attribute.Counter }
 	Context.AttackTags = GetAssetTags().Filter(FGameplayTagContainer(LOAGameplayTags::Skill_Attribute));
+	// 보낸 스킬 (보호막 덮어쓰기가 "같은 스킬"을 알아보는 데 쓴다). 이 함수가 const라 const를 뗀다 (값은 바꾸지 않음)
+	Context.SourceAbility = const_cast<ULOAGameplayAbility*>(this);
 	return Context;
 }
 
@@ -348,12 +427,13 @@ EDataValidationResult ULOAGameplayAbility::IsDataValid(FDataValidationContext& C
 	// 메시지 앞에 붙일 이름 (BP 클래스 이름. 예: GA_Berserker_Whirlwind_C)
 	const FString OwnerName = GetNameSafe(GetClass());
 
-	// ① 쿨타임 시간은 있는데 태그가 없으면 쿨타임이 아무것도 막지 못한다.
-	if (CooldownDuration > 0.f && CooldownTags.IsEmpty())
+	// ① 쿨타임 시간은 있는데 태그가 없으면 쿨타임이 아무것도 막지 못한다. (레벨 1 값으로 확인)
+	const float CooldownAtLevel1 = CooldownDuration.GetValueAtLevel(1.f);
+	if (CooldownAtLevel1 > 0.f && CooldownTags.IsEmpty())
 	{
 		Context.AddError(FText::FromString(FString::Printf(
 			TEXT("%s : Cooldown Duration is %.1fs but Cooldown Tags is empty. Cooldown will not work."),
-			*OwnerName, CooldownDuration)));
+			*OwnerName, CooldownAtLevel1)));
 		Result = EDataValidationResult::Invalid;
 	}
 

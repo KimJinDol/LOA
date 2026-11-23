@@ -15,7 +15,7 @@
 //     InnerRatio : 안쪽 반지름 ÷ 바깥 반지름 (도넛 구멍. 0 = 구멍 없음)     예) 도넛 400~800 → 0.5
 //     Angle      : 부채꼴 전체 각도 (도). 원은 360                            예) 앞 베기 → 90
 //     StartTime  : 차오르기 시작한 서버 시각 (초)                              예) 100.0
-//     HitTime    : 꽉 차는 서버 시각 = 판정 시각 (초)                          예) 101.2
+//     HitTime    : 꽉 차는 서버 시각 (초). 판정 시각과 같거나 앞 (꽉 찬 뒤 터지는 장판)   예) 101.2
 //   차오름(Fill)은 C++이 쓰지 않는다. 머티리얼이 MPC_Telegraph의 ServerTime으로 직접 계산한다. (MF_TelegraphFill)
 //     Fill = Saturate((ServerTime − StartTime) ÷ (HitTime − StartTime))
 //

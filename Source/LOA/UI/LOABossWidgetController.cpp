@@ -1,8 +1,10 @@
 // LOABossWidgetController.cpp
 
 #include "UI/LOABossWidgetController.h"
+#include "UI/Status/LOAStatusTracker.h"
 #include "Character/Monster/Boss/LOABossCharacter.h"
 #include "AbilitySystem/Attributes/LOAAttributeSet_Common.h"
+#include "AbilitySystem/Attributes/LOAAttributeSet_Boss.h"
 #include "Core/LOALog.h"
 
 #include "AbilitySystemComponent.h"
@@ -29,6 +31,20 @@ void ULOABossWidgetController::Init(ALOABossCharacter* InBoss)
 		.AddUObject(this, &ThisClass::HandleHealthChanged);
 	MaxHealthChangedHandle = BossASC->GetGameplayAttributeValueChangeDelegate(ULOAAttributeSet_Common::GetMaxHealthAttribute())
 		.AddUObject(this, &ThisClass::HandleHealthChanged);
+
+	// 무력화 게이지 (2026-11-18 apply120). 무력화가 없는 보스여도 알림은 건다 (값이 안 바뀌니 안 울릴 뿐)
+	//   클라에서는 꾸러미로 붙는 무력화 스탯창이 아직 복제 전일 수 있다 → ASC 알림은 스탯창이 아니라 칸 이름으로 걸리므로 도착하면 울린다
+	StaggerChangedHandle = BossASC->GetGameplayAttributeValueChangeDelegate(ULOAAttributeSet_Boss::GetStaggerAttribute())
+		.AddUObject(this, &ThisClass::HandleStaggerChanged);
+	MaxStaggerChangedHandle = BossASC->GetGameplayAttributeValueChangeDelegate(ULOAAttributeSet_Boss::GetMaxStaggerAttribute())
+		.AddUObject(this, &ThisClass::HandleStaggerChanged);
+
+	// 상태 아이콘. 남은 시간은 보스의 시간 복제 부품에서 (Minimal ASC라 클라에 GE가 없음)
+	if (!StatusTracker)
+	{
+		StatusTracker = NewObject<ULOAStatusTracker>(this);
+	}
+	StatusTracker->Init(BossASC, InBoss->GetStatusReplicationComponent());
 }
 
 void ULOABossWidgetController::BroadcastInitialValues()
@@ -39,6 +55,7 @@ void ULOABossWidgetController::BroadcastInitialValues()
 	}
 
 	BroadcastHealth();
+	BroadcastStagger();
 }
 
 void ULOABossWidgetController::Shutdown()
@@ -48,10 +65,19 @@ void ULOABossWidgetController::Shutdown()
 	{
 		BossASC->GetGameplayAttributeValueChangeDelegate(ULOAAttributeSet_Common::GetHealthAttribute()).Remove(HealthChangedHandle);
 		BossASC->GetGameplayAttributeValueChangeDelegate(ULOAAttributeSet_Common::GetMaxHealthAttribute()).Remove(MaxHealthChangedHandle);
+		BossASC->GetGameplayAttributeValueChangeDelegate(ULOAAttributeSet_Boss::GetStaggerAttribute()).Remove(StaggerChangedHandle);
+		BossASC->GetGameplayAttributeValueChangeDelegate(ULOAAttributeSet_Boss::GetMaxStaggerAttribute()).Remove(MaxStaggerChangedHandle);
+	}
+
+	if (StatusTracker)
+	{
+		StatusTracker->Shutdown();
 	}
 
 	HealthChangedHandle.Reset();
 	MaxHealthChangedHandle.Reset();
+	StaggerChangedHandle.Reset();
+	MaxStaggerChangedHandle.Reset();
 	Boss.Reset();
 	ASC.Reset();
 }
@@ -73,4 +99,24 @@ void ULOABossWidgetController::BroadcastHealth() const
 	OnBossHealthChanged.Broadcast(
 		BossASC->GetNumericAttribute(ULOAAttributeSet_Common::GetHealthAttribute()),
 		BossASC->GetNumericAttribute(ULOAAttributeSet_Common::GetMaxHealthAttribute()));
+}
+
+void ULOABossWidgetController::HandleStaggerChanged(const FOnAttributeChangeData& Data)
+{
+	// 체력과 같은 이유로 현재/최대를 둘 다 다시 읽는다
+	BroadcastStagger();
+}
+
+void ULOABossWidgetController::BroadcastStagger() const
+{
+	const UAbilitySystemComponent* BossASC = ASC.Get();
+	if (!BossASC)
+	{
+		return;
+	}
+
+	// 무력화 스탯창이 없으면(무력화 없는 보스, 클라에 아직 복제 전) GetNumericAttribute가 0 → (0, 0) → 위젯이 숨긴다
+	OnBossStaggerChanged.Broadcast(
+		BossASC->GetNumericAttribute(ULOAAttributeSet_Boss::GetStaggerAttribute()),
+		BossASC->GetNumericAttribute(ULOAAttributeSet_Boss::GetMaxStaggerAttribute()));
 }

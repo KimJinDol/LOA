@@ -16,11 +16,14 @@ ULOAGA_Dodge::ULOAGA_Dodge(const FObjectInitializer& ObjectInitializer)
 	// 스킬 시전 중에도 발동되도록, 부모가 넣어 둔 "행동 금지 중 발동 불가" 조건을 뺀다.
 	ActivationBlockedTags.RemoveTag(LOAGameplayTags::State_Block_Ability);
 
+	// 회피라는 이름표. 저스트 가드 GA가 이 태그로 회피를 막는다 (Block Abilities with Tag). BP에서 지우지 말 것
+	SetAssetTags(FGameplayTagContainer(LOAGameplayTags::Ability_Common_Dodge));
+
 	// 회피하는 동안 피격 이상·상태 이상 면역. (데미지는 받는다)
 	// Activation Owned Tags: Ability가 실행 중인 동안만 ASC에 붙고, 끝나면(몽타주 끝 / 후딜에서 끊김 / 취소) GAS가 뗀다.
 	// → 로아처럼 "끊지 않으면 회피 모션 내내 면역, 끊으면 그 순간 해제"가 된다. BP에서 더하거나 뺄 수 있다.
 	ActivationOwnedTags.AddTag(LOAGameplayTags::State_Immune_Push);
-	ActivationOwnedTags.AddTag(LOAGameplayTags::State_Immune_Debuff);
+	ActivationOwnedTags.AddTag(LOAGameplayTags::State_Immune_Status);
 
 	// bBlockMove / bBlockAbility는 부모 기본값(true) 그대로:
 	// 회피 중에는 우클릭 이동도, 다른 스킬도 받지 않는다. 몽타주의 Unlock 노티파이(대시 끝)부터 풀린다.
@@ -71,7 +74,7 @@ void ULOAGA_Dodge::OnDodgeMoveFinished()
 {
 	// 몽타주가 없으면 끝낼 신호가 없으므로 여기서 정상 종료.
 	// 몽타주가 있으면 아무것도 안 한다: 착지 동작은 몽타주가 계속 재생하고, 몽타주가 끝나거나 후딜에서 끊길 때 종료된다.
-	if (!Montage)
+	if (!GetMontage())
 	{
 		EndAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo, true, false);
 	}

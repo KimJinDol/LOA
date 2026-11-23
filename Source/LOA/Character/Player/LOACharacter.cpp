@@ -6,6 +6,17 @@
 #include "Player/LOAPlayerState.h"
 #include "Core/LOACollisionChannels.h"
 #include "Character/Player/LOACharacterMovementComponent.h"
+#include "Character/LOADeathReactionComponent.h"
+#include "Combat/LOAJustGuardComponent.h"
+#include "Combat/LOACrowdControlPredictionComponent.h"
+#include "AbilitySystem/Abilities/LOAGA_Death.h"
+#include "AbilitySystem/Attributes/LOAAttributeSet_Common.h"
+#include "Library/LOACombatLibrary.h"
+#include "AbilitySystem/Effects/LOAGE_Kill.h"
+#include "Core/LOAGameplayTags.h"
+#include "Animation/LOAAnimInstance.h"
+#include "Game/LOAGameState.h"
+#include "Game/LOARaidSubsystem.h"
 
 #include "AbilitySystemComponent.h"
 #include "AbilitySystemInterface.h"
@@ -19,6 +30,8 @@
 #include "Engine/SkeletalMesh.h"
 #include "Animation/AnimInstance.h"
 #include "Net/UnrealNetwork.h"
+#include "Engine/World.h"
+#include "TimerManager.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(LOACharacter)
 
@@ -72,6 +85,24 @@ ALOACharacter::ALOACharacter(const FObjectInitializer& ObjectInitializer)
 	// 겹쳤을 때 빠져나오기와 관통 스킬(그 순간만 무시)은 ULOACharacterMovementComponent가 이 응답을 바꾼다. (한 곳에서만)
 	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
 	GetCapsuleComponent()->SetCollisionResponseToChannel(LOACollision::BodyBlock, ECR_Block);
+
+	// 레이드 벽 (LOACollisionChannels.h [RaidWall / RaidEdge]). 가장자리 벽은 CC 궤적 동안만 이동 컴포넌트가 무시로 바꾼다
+	GetCapsuleComponent()->SetCollisionResponseToChannel(LOACollision::RaidWall, ECR_Block);
+	GetCapsuleComponent()->SetCollisionResponseToChannel(LOACollision::RaidEdge, ECR_Block);
+	// 플레이어만 막는 벽 (LOACollisionChannels.h [PlayerWall], apply130). 이동 컴포넌트가 바꾸지 않는다 → CC·보스 몸 통과 중에도 막힌다
+	GetCapsuleComponent()->SetCollisionResponseToChannel(LOACollision::PlayerWall, ECR_Block);
+
+	// ---------- 사망 반응 ----------
+	// State.Dead가 붙으면 충돌·이동을 끄고, 떨어지면 되돌린다. (보스와 같은 부품. ASC 준비 후 TryFinalizeInitialization에서 연결)
+	DeathReactionComponent = CreateDefaultSubobject<ULOADeathReactionComponent>(TEXT("DeathReactionComponent"));
+
+	// ---------- 저스트 가드 장부 ----------
+	// 누른 기록은 GA(몸통)보다 오래 남아야 한다 (피해자 판정은 맞은 뒤 최대 1초 뒤에 검증). 그래서 몸에 붙인다. 모든 직업 공통
+	JustGuardComponent = CreateDefaultSubobject<ULOAJustGuardComponent>(TEXT("JustGuardComponent"));
+
+	// ---------- 예측 피격 반응 ----------
+	// 피해자 판정 "맞음" → 서버 CC가 오기 전에 내 화면에서 먼저 멈춤·CC 몽타주. 모든 직업 공통
+	CrowdControlPredictionComp = CreateDefaultSubobject<ULOACrowdControlPredictionComponent>(TEXT("CrowdControlPredictionComp"));
 }
 
 // =============================================================================
@@ -138,8 +169,25 @@ void ALOACharacter::UnPossessed()
 	Super::UnPossessed();
 }
 
+void ALOACharacter::BeginPlay()
+{
+	Super::BeginPlay();
+
+	// 줌 배율의 기준 거리 (BP_LOAHero의 CameraBoom 값. 코드에 숫자 없음)
+	DefaultCameraArmLength = CameraBoom->TargetArmLength;
+
+	// [서버] 낙사했을 때 돌아올 자리. 처음엔 스폰 위치, 그 뒤로는 걷는 동안 0.25초마다 갱신
+	if (HasAuthority())
+	{
+		LastGroundLocation = GetActorLocation();
+		GetWorldTimerManager().SetTimer(LastGroundTimerHandle, this, &ThisClass::RecordLastGroundLocation, LastGroundRecordInterval, true);
+	}
+}
+
 void ALOACharacter::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	GetWorldTimerManager().ClearTimer(LastGroundTimerHandle);
+
 	// [모든 컴퓨터] 캐릭터가 사라짐. 클라이언트는 UnPossessed가 없으므로 여기서 정리된다.
 	UninitializeCharacter();
 
@@ -231,6 +279,28 @@ void ALOACharacter::TryFinalizeInitialization()
 	// [모든 컴퓨터] 외형, 직업 전용 컴포넌트
 	ApplyClassAvatarData();
 	CreateClassComponents();
+
+	// [모든 컴퓨터] State.Dead를 보기 시작한다. 이미 죽어 있으면(늦게 들어온 플레이어) 바로 시체 반응
+	if (DeathReactionComponent)
+	{
+		// [서버] 죽으면 GameState에 알린다 (전멸 확인). 연결보다 먼저 걸어야 "이미 죽어 있음"도 받는다
+		if (HasAuthority())
+		{
+			DeathReactionComponent->OnDied.AddUniqueDynamic(this, &ThisClass::HandleDiedOnServer);
+		}
+		DeathReactionComponent->InitializeWithAbilitySystem(CachedAbilitySystemComponent.Get());
+	}
+
+	// [모든 컴퓨터] AnimBP 태그 → 변수 연결 (State.Body.Dead → bIsDead). 외형 적용(AnimBP 교체) 뒤에 해야 새 AnimBP에 걸린다.
+	if (ULOAAnimInstance* AnimInstance = GetMesh() ? Cast<ULOAAnimInstance>(GetMesh()->GetAnimInstance()) : nullptr)
+	{
+		AnimInstance->InitializeWithAbilitySystem(CachedAbilitySystemComponent.Get());
+	}
+	else
+	{
+		// AnimBP 부모가 LOAAnimInstance가 아니면 시체 포즈가 동작하지 않는다. (충돌·이동은 사망 반응 부품이 처리하므로 동작)
+		LOA_LOG(this, Warning, TEXT("[Character] AnimInstance is not a LOAAnimInstance. Tag-driven poses (dead) will not work."));
+	}
 
 	LOA_LOG(this, Log, TEXT("Character initialized. Class = [%s]"), *GetNameSafe(CharacterClassData));
 
@@ -356,6 +426,12 @@ void ALOACharacter::UninitializeCharacter()
 {
 	DestroyClassComponents();
 
+	if (DeathReactionComponent)
+	{
+		DeathReactionComponent->OnDied.RemoveDynamic(this, &ThisClass::HandleDiedOnServer);
+		DeathReactionComponent->UninitializeFromAbilitySystem();
+	}
+
 	UAbilitySystemComponent* ASC = CachedAbilitySystemComponent.Get();
 
 	// ASC의 몸이 아직 "나"일 때만 정리한다.
@@ -381,3 +457,207 @@ void ALOACharacter::UninitializeCharacter()
 	bAbilityActorInfoReady = false;
 	bCharacterInitialized = false;
 }
+
+// =============================================================================
+// 사망 / 부활
+// =============================================================================
+
+bool ALOACharacter::IsDead() const
+{
+	const UAbilitySystemComponent* ASC = CachedAbilitySystemComponent.Get();
+	return ASC && ASC->HasMatchingGameplayTag(LOAGameplayTags::State_Body_Dead);
+}
+
+bool ALOACharacter::ReviveFromDeath(bool bGrantInvulnerability)
+{
+	UAbilitySystemComponent* ASC = CachedAbilitySystemComponent.Get();
+	if (!HasAuthority() || !ASC || !IsDead())
+	{
+		return false;
+	}
+
+	// ① 아직 돌고 있는 GA_Death(사망 몽타주)를 끝낸다. 목록을 먼저 모으고 취소한다 (도는 중에 목록을 건드리지 않게)
+	TArray<FGameplayAbilitySpecHandle> DeathHandles;
+	for (const FGameplayAbilitySpec& Spec : ASC->GetActivatableAbilities())
+	{
+		if (Spec.IsActive() && Spec.Ability && Spec.Ability->IsA<ULOAGA_Death>())
+		{
+			DeathHandles.Add(Spec.Handle);
+		}
+	}
+	for (const FGameplayAbilitySpecHandle& Handle : DeathHandles)
+	{
+		ASC->CancelAbilityHandle(Handle);
+	}
+
+	// ② 체력 가득. State.Dead가 붙어 있는 동안 채운다 → 살아난 순간 체력 0인 틈이 없다.
+	//    값만 바꾸는 ApplyModToAttribute를 쓴다. (사망 알림 경로를 거칠 필요가 없음. 낙사는 GE로 해야 함 → ULOAGE_Kill)
+	const float MaxHealth = ASC->GetNumericAttribute(ULOAAttributeSet_Common::GetMaxHealthAttribute());
+	ASC->ApplyModToAttribute(ULOAAttributeSet_Common::GetHealthAttribute(), EGameplayModOp::Override, MaxHealth);
+
+	// ③ 무적 N초 (State.Body.Invulnerable. 시간이 지나면 스스로 사라짐 → 모든 컴퓨터에 복제)
+	if (bGrantInvulnerability && ReviveInvulnerableDuration > 0.f)
+	{
+		ULOACombatLibrary::ApplyStateTags(ASC, FGameplayTagContainer(LOAGameplayTags::State_Body_Invulnerable), ReviveInvulnerableDuration);
+	}
+
+	// ④ State.Dead를 준 GE를 지운다 → 태그가 모든 컴퓨터에서 사라짐
+	//    → 각 컴퓨터의 ULOADeathReactionComponent가 충돌·이동을 되돌리고, AnimBP는 시체 포즈를 끝낸다.
+	ASC->RemoveActiveEffectsWithGrantedTags(FGameplayTagContainer(LOAGameplayTags::State_Body_Dead));
+
+	LOA_LOG(this, Log, TEXT("[Revive] Revived. Health %.0f, invulnerable %.1fs"), MaxHealth, bGrantInvulnerability ? ReviveInvulnerableDuration : 0.f);
+	return true;
+}
+
+void ALOACharacter::RespawnAt(const FVector& Location)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	// ① 죽어 있으면 살린다 (전멸 뒤 부활은 무적 없음: 보스가 대기 상태라 공격이 없다)
+	if (IsDead())
+	{
+		ReviveFromDeath(/*bGrantInvulnerability*/ false);
+	}
+
+	// ② 부활 자리로. 살아난 뒤라 이동이 켜져 있다. 멀리 순간이동이라 주인 클라에도 바로 알린다 (낙사 복귀 자리도 여기로)
+	RelocateBody(Location);
+
+	LOA_LOG(this, Log, TEXT("[Raid] Respawned at %s"), *Location.ToCompactString());
+}
+
+void ALOACharacter::RelocateBody(const FVector& Location)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	if (UCharacterMovementComponent* Movement = GetCharacterMovement())
+	{
+		Movement->StopMovementImmediately();
+	}
+	SetActorLocation(Location, false, nullptr, ETeleportType::TeleportPhysics);
+
+	// 주인 컴퓨터도 같은 자리로. (시체는 이동이 꺼져 있어 이동 보정이 안 온다)
+	ClientSnapToLocation(Location);
+
+	// 낙사했을 때 돌아올 자리도 여기로
+	LastGroundLocation = Location;
+}
+
+void ALOACharacter::SetCameraZoomScale(float Scale)
+{
+	if (DefaultCameraArmLength <= 0.f)
+	{
+		return;
+	}
+
+	// 예) 기준 1600, 배율 0.6 → 960. 같은 값이면 그대로
+	const float NewLength = DefaultCameraArmLength * Scale;
+	if (!FMath::IsNearlyEqual(CameraBoom->TargetArmLength, NewLength))
+	{
+		CameraBoom->TargetArmLength = NewLength;
+	}
+}
+
+void ALOACharacter::HandleDiedOnServer(AActor* DeadActor)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	// 무너진 구역 위 허공에서 죽었으면 (떨어지는 중에 맞음 등) 시체는 이동이 꺼져 그 자리에 뜬 채로 남는다 → 가운데 원으로
+	//   사용자 규칙: 시체는 언제나 부활할 수 있는 곳에 (2026-11-14)
+	if (const ULOARaidSubsystem* Raid = ULOARaidSubsystem::Get(this))
+	{
+		FVector Recover;
+		if (Raid->FindRecoverLocation(GetActorLocation(), Recover))
+		{
+			LOA_LOG(this, Log, TEXT("[Terrain] Died over a collapsed zone. Body moved to %s."), *Recover.ToCompactString());
+			RelocateBody(Recover);
+		}
+	}
+
+	if (ALOAGameState* LOAGameState = GetWorld() ? GetWorld()->GetGameState<ALOAGameState>() : nullptr)
+	{
+		LOAGameState->NotifyPlayerDied(this);
+	}
+}
+
+// =============================================================================
+// 낙사
+// =============================================================================
+
+void ALOACharacter::RecordLastGroundLocation()
+{
+	const UCharacterMovementComponent* Movement = GetCharacterMovement();
+	const UWorld* World = GetWorld();
+	if (!Movement || !World || !Movement->IsMovingOnGround() || IsDead())
+	{
+		return;
+	}
+
+	// 몸 중심 바로 아래에 걸을 수 있는 바닥이 있을 때만 저장한다.
+	// 예) 낭떠러지 끝에 캡슐이 반쯤 걸쳐 서 있음 → 중심 아래가 허공 → 저장 안 함 (이전 위치 유지)
+	const FVector Start = GetActorLocation();
+	const FVector End = Start - FVector(0.f, 0.f, GetCapsuleComponent()->GetScaledCapsuleHalfHeight() + 50.f);
+
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(LOALastGround), false, this);
+	FHitResult Hit;
+	if (World->LineTraceSingleByChannel(Hit, Start, End, GetCapsuleComponent()->GetCollisionObjectType(), Params)
+		&& Movement->IsWalkable(Hit))
+	{
+		LastGroundLocation = Start;
+	}
+}
+
+void ALOACharacter::FellOutOfWorld(const UDamageType& DmgType)
+{
+	// Super를 부르지 않는다. (엔진 기본 = 숨기고 액터 삭제 → 플레이어가 사라짐)
+
+	// 클라(내 캐릭터의 이동 예측 중에 불림): 아무것도 안 한다. 서버가 옮겨 주고 ClientSnapToLocation으로 알려 준다.
+	// 서버가 처리하기 전까지 매 프레임 다시 불릴 수 있다 → 로그도 남기지 않는다.
+	if (!HasAuthority() || IsDead())
+	{
+		return;
+	}
+
+	// ① 마지막으로 밟은 땅. 그 땅이 무너진 구역 안이면 가운데 원 안쪽 (2026-11-14)
+	//    예) 가운데 원 반지름 800, 여유 100. 왼쪽 구역 예고를 못 피함 → 마지막으로 밟은 땅 = 중심에서 서쪽 1200 → 서쪽 700
+	FVector Destination = LastGroundLocation;
+	if (const ULOARaidSubsystem* Raid = ULOARaidSubsystem::Get(this))
+	{
+		Raid->FindRecoverLocation(LastGroundLocation, Destination);
+	}
+
+	LOA_LOG(this, Log, TEXT("[Fall] Fell out of world at %s. Moving to %s (last ground %s) and killing."),
+		*GetActorLocation().ToCompactString(), *Destination.ToCompactString(), *LastGroundLocation.ToCompactString());
+
+	// ② 그 자리로 옮긴다 (떨어지던 속도는 버림). 주인 컴퓨터도 같은 자리로 (곧 이동이 꺼지므로 이동 보정을 기다리지 않는다)
+	RelocateBody(Destination);
+
+	// ③ 체력 0 → 보통 사망 경로 (Event.Trigger.Death → GA_Death). 데미지가 아니라서 데미지 숫자는 없다. (막타 = 자기 자신)
+	//    GE(ULOAGE_Kill)로 해야 스탯창의 PostGameplayEffectExecute를 거쳐 Event.Death가 나간다.
+	//    ApplyModToAttribute(Unsafe)는 값만 바꿔서 체력 0인데 안 죽는다 (2026-10-23 확인. ULOAGE_Kill 헤더)
+	if (UAbilitySystemComponent* ASC = CachedAbilitySystemComponent.Get())
+	{
+		ASC->ApplyGameplayEffectToSelf(GetDefault<ULOAGE_Kill>(), 1.f, ASC->MakeEffectContext());
+	}
+}
+
+void ALOACharacter::ClientSnapToLocation_Implementation(FVector_NetQuantize Location)
+{
+	if (UCharacterMovementComponent* Movement = GetCharacterMovement())
+	{
+		Movement->StopMovementImmediately();
+	}
+	SetActorLocation(Location, false, nullptr, ETeleportType::TeleportPhysics);
+
+	// 이동 예측 기록은 지우지 않는다. (ResetPredictionData_Client를 부르면 클라 이동 시계가 0부터 다시 시작해서
+	//  서버가 "옛날 시각의 이동"으로 보고 한동안 전부 버린다 → ServerMove: TimeStamp expired 경고가 쏟아짐. 2026-10-23 확인)
+	// 남은 기록이 서버와 달라도 서버의 보통 위치 보정으로 맞춰진다.
+}

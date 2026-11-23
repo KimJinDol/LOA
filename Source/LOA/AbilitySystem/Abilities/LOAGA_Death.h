@@ -4,11 +4,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // [흐름] (전부 서버)
 //
-//   데미지 → Common 스탯창: 체력 300 → 0 "처음 0이 됨" → 자기 ASC에 Event.Death
-//     → 이 Ability 발동 (Trigger = Event.Death)
+//   데미지 → Common 스탯창: 체력 300 → 0 "처음 0이 됨" → 자기 ASC에 Event.Trigger.Death
+//     → 이 Ability 발동 (Trigger = Event.Trigger.Death)
 //          ① 다른 Ability 모두 취소              (패턴·스킬 몽타주가 멈춘다. AbilityTagsToKeep에 해당하면 남김)
-//          ② State.Dead 태그 부여               (ULOAGE_InfiniteTags. 모든 컴퓨터에 복제)
+//          ①-1 버프·디버프 지우기               (State.Buff.* / State.Debuff.* 를 주는 GE 전부, 보호막 포함. 2026-11-07)
+//          ② State.Body.Dead 태그 부여               (ULOAGE_InfiniteTags. 모든 컴퓨터에 복제)
 //               → 각 컴퓨터: AnimBP가 죽음 상태로 (ULOAAnimInstance), 몸 반응 부품이 캡슐 충돌 끄기·이동 멈춤
+//               → 서버: 아이덴티티 GA가 게이지를 0으로 (ULOAGA_Identity::OnDeadTagChanged. 이 GA는 아이덴티티를 모른다)
 //          ③ 스킬 모듈 시작                      (선택. 예: 죽을 때 폭발 = Apply 모듈)
 //          ④ 사망 몽타주 재생 → 끝나면 Ability 종료 (몽타주가 비어 있으면 바로 종료)
 //
@@ -19,13 +21,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // [수명 - Ability는 끝나도 State.Dead는 남는다]
 //   이 Ability는 몽타주가 끝나면 종료한다. 시체 포즈는 AnimBP가 태그를 보고 유지하므로 붙잡고 있을 게 없다.
-//   State.Dead GE는 종료해도 지우지 않는다. 지우는 쪽 = "부활" (아직 없음. 보스는 부활이 없으므로 영구)
+//   State.Body.Dead GE는 종료해도 지우지 않는다. 지우는 쪽 = "부활" (아직 없음. 보스는 부활이 없으므로 영구)
 //   → 부활을 만들 때: State.Dead를 주는 GE를 지운다. (RemoveActiveEffectsWithGrantedTags)
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // [네트워크]
 // - ServerOnly: 서버만 실행한다. 클라이언트는 결과만 본다.
-//     State.Dead → ASC 태그 복제 (모든 컴퓨터) / 몽타주 → ASC 몽타주 복제 (모든 컴퓨터)
+//     State.Body.Dead → ASC 태그 복제 (모든 컴퓨터) / 몽타주 → ASC 몽타주 복제 (모든 컴퓨터)
 // - 결과가 남는 일(태그 GE, 모듈의 데미지)은 서버 일이므로 예측할 필요가 없다.
 // - 늦게 들어온 플레이어도 태그가 이미 붙은 상태로 보스를 받으므로 시체 포즈·충돌 꺼짐이 바로 맞는다.
 //
@@ -79,4 +81,8 @@ protected:
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "LOA|Ability|Death")
 	FGameplayTagContainer AbilityTagsToKeep;
+
+private:
+	/** [서버] State.Buff.* / State.Debuff.* 를 주는 GE를 전부 지운다 (보호막 GE 포함 → Shield도 0). (2026-11-07) */
+	void ClearBuffsOnDeath() const;
 };

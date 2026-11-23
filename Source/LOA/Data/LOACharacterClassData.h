@@ -7,7 +7,9 @@
 //   DA_Class_Berserker
 //    ├─ 직업 태그 / 이름 / 아이콘        : UI 표시, 직업 구분
 //    ├─ 외형 (메시, 애님 BP, 메시 위치)   : 캐릭터 몸에 적용
+//    ├─ 로비 대기 동작                    : 로비 미리보기 (ALOACharacterPreview, 2026-11-14)
 //    ├─ 항상 장착 AbilityDataSet 목록     : 회피, 기본 공격, 일반 스킬, 아이덴티티, 초기 스탯
+//    ├─ 몽타주 표 (몽타주 태그 → 몽타주)  : 직업끼리 같이 쓰는 GA(회피, 피격 반응, 사망)가 직업마다 다른 동작을 튼다
 //    └─ 직업 전용 컴포넌트 목록 (선택)    : 직업만의 특수 기능이 필요할 때
 //
 // 새 직업 추가 = 이 에셋을 하나 더 만드는 것. C++ 수정 없음.
@@ -16,6 +18,17 @@
 // [여기 없는 것]
 // - 키 입력 설정: 모든 직업이 같은 키 배치를 쓰므로 PlayerController의 InputConfig가 담당한다.
 // - 수치(체력, 공격력 등): AbilityDataSet 안의 초기화 Effect → 커브 테이블이 담당한다.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// [몽타주 표 - Montages] (2026-11-08)
+// GA 하나를 여러 직업이 같이 쓰되, 몽타주만 직업마다 다르게 하려고 둔다.
+//   GA_bk_Airborne : Montage = AM_Berserker_Airborne (기본), Montage Tag = Montage.Airborne
+//   DA_Class_Serath: Montages = { Montage.Airborne → AM_Serath_Airborne }
+//   → 세라스가 띄워지면 AM_Serath_Airborne, 버서커는 표에 없으니 GA 기본 몽타주
+// 고르는 곳: ULOAGameplayAbility::GetMontageFor
+// [규칙] 같은 태그로 바꿔 끼우는 몽타주는 GA 기본 몽타주와 섹션 이름·노티파이 태그를 똑같이 맞춘다.
+//   GA가 섹션 이름(Air, GetUp …)과 노티파이(Event.Montage.*)로 움직이기 때문이다. 저장 시 검사는 GA 기본 몽타주만 본다.
+// [하드 참조인 이유] 피격 반응은 맞는 순간 바로 틀어야 해서 그때 불러오면 멈칫한다. GA도 이미 몽타주를 하드 참조로 든다.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // [UPrimaryDataAsset인 이유]
@@ -47,6 +60,8 @@ class USkeletalMesh;
 class UAnimInstance;
 class UTexture2D;
 class UActorComponent;
+class UAnimMontage;
+class UAnimSequence;
 
 // =============================================================================
 // 직업 전용 컴포넌트 한 개
@@ -97,8 +112,15 @@ class LOA_API ULOACharacterClassData : public UPrimaryDataAsset
 	GENERATED_BODY()
 
 public:
-	/** 에셋 매니저가 이 에셋을 찾을 때 쓰는 ID. 종류 이름 = "CharacterClass" */
+	/** 에셋 매니저가 이 에셋을 찾을 때 쓰는 ID. 종류 이름 = GetPrimaryAssetTypeName() */
 	virtual FPrimaryAssetId GetPrimaryAssetId() const override;
+
+	/**
+	 * 에셋 매니저 종류 이름 "CharacterClass". 한 곳에서 정한다 (2026-11-14 apply113)
+	 * 쓰는 곳: GetPrimaryAssetId / 로비 직업 목록 / 접속 주소의 직업 읽기 (FLOACharacterSelection)
+	 * DefaultGame.ini의 Primary Asset Types to Scan 이름과 같아야 한다
+	 */
+	static FPrimaryAssetType GetPrimaryAssetTypeName();
 
 #if WITH_EDITOR
 	/** 저장 / 데이터 검증 시 빈 칸 같은 설정 실수를 잡아낸다. */
@@ -142,6 +164,14 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "LOA|Avatar")
 	FTransform MeshRelativeTransform = FTransform::Identity;
 
+	/**
+	 * 로비 미리보기에서 반복 재생할 동작 하나 (대기 포즈). (2026-11-14 apply113, 사용자 A)
+	 * 게임용 애님 BP(AnimClass)는 캐릭터·ASC가 있어야 돌아서 로비에서는 쓰지 않는다.
+	 * 비우면 미리보기는 기본 자세(T포즈 등)로 선다.
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "LOA|Avatar", meta = (AssetBundles = "Lobby"))
+	TSoftObjectPtr<UAnimSequence> LobbyAnimation;
+
 	// ---------------------------------------------------------------------
 	// 능력 (서버에서 부여)
 	// ---------------------------------------------------------------------
@@ -154,6 +184,20 @@ public:
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "LOA|Abilities")
 	TArray<TObjectPtr<const ULOAPlayerAbilityDataSet>> DefaultAbilityDataSets;
+
+	// ---------------------------------------------------------------------
+	// 몽타주 표 (모든 컴퓨터. 같이 쓰는 GA가 직업마다 다른 몽타주를 튼다)
+	// ---------------------------------------------------------------------
+
+	/**
+	 * 몽타주 태그 → 이 직업의 몽타주. GA의 Montage Tag와 같은 태그를 찾아 GA 기본 몽타주 대신 튼다.
+	 * 표에 없는 태그는 GA 기본 몽타주. 예: { Montage.Dodge → AM_Serath_Dodge, Montage.Death → AM_Serath_Death }
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "LOA|Montage", meta = (Categories = "Montage"))
+	TMap<FGameplayTag, TObjectPtr<UAnimMontage>> Montages;
+
+	/** 표에서 이 태그의 몽타주. 없으면 nullptr */
+	UAnimMontage* FindMontage(const FGameplayTag& MontageTag) const;
 
 	// ---------------------------------------------------------------------
 	// 직업 전용 컴포넌트 (선택)

@@ -18,7 +18,7 @@
 //   보스 점프 착지 : On Event JumpStart, Distance 800, Height 300, Arrive Event = Hit.1 (착지 판정과 같은 순간 도착)
 //   보스 돌진      : Distance 1200, Height 0, Arrive Event = 돌진 끝 노티파이
 //   패턴 D (사라졌다 맵 중앙에 쿵) : Destination Location, Location Tag = Location.Arena.Center, Height 0,
-//                                  Arrive Event = 내려찍기 예고 노티파이. (보스는 State.Hidden 구간이라 이동이 안 보인다)
+//                                  Arrive Event = 내려찍기 예고 노티파이. (보스는 State.Body.Hidden 구간이라 이동이 안 보인다)
 //   플레이어 관통 대시(베스티지) : Distance 600, Height 0, Duration 0.25, Pass Through Body Blockers ☑
 //                                  + 같은 GA에 Apply(Box 600 × 200)로 지나갈 길 판정
 //
@@ -28,7 +28,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // [흐름]
 //   SkillModuleTriggered : 걸린 시간 정하기 (Arrive Event까지 남은 초, 없으면 Duration)
-//                          → Pass Through Body Blockers면 내 ASC에 State.PassThroughBodyBlock (로컬 태그)
+//                          → Pass Through Body Blockers면 내 ASC에 State.Body.PassThroughBodyBlock (로컬 태그)
 //                            (플레이어 이동 컴포넌트가 이 태그를 보고 그동안 몸 막이를 무시. 이 모듈은 그 컴포넌트를 모른다)
 //                          → Height 0: ApplyRootMotionMoveToForce(보는 방향 Distance 지점, 시간)
 //                            Height > 0: ApplyRootMotionJumpForce(보는 방향, Distance, Height, 시간)
@@ -122,7 +122,7 @@ protected:
 	/**
 	 * 이동하는 동안 보스·몬스터의 몸 막이(ULOABodyBlockerComponent)를 뚫고 지나간다. 끝나면 원래대로.
 	 * 관통 스킬(예: 베스티지)만 켠다. 보스 패턴은 필요 없다. (보스 캡슐은 원래 플레이어를 통과)
-	 * 이동하는 동안 State.PassThroughBodyBlock 태그를 붙인다. 태그를 보는 건 플레이어 이동 컴포넌트뿐이다.
+	 * 이동하는 동안 State.Body.PassThroughBodyBlock 태그를 붙인다. 태그를 보는 건 플레이어 이동 컴포넌트뿐이다.
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "Move")
 	bool bPassThroughBodyBlockers = false;
@@ -132,7 +132,7 @@ private:
 	UFUNCTION()
 	void OnMoveFinished();
 
-	/** Pass Through Body Blockers: State.PassThroughBodyBlock 붙이기 / 떼기 */
+	/** Pass Through Body Blockers: State.Body.PassThroughBodyBlock 붙이기 / 떼기 */
 	void SetPassThrough(bool bEnable);
 
 	/** 이번 발동에서 태그를 붙였나 (한 번만 떼려고. 같은 태그를 다른 곳에서도 붙였으면 그 개수는 남는다) */

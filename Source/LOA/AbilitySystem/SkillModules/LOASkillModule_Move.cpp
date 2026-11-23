@@ -156,11 +156,11 @@ void ULOASkillModule_Move::SetPassThrough(bool bEnable)
 	// 실제 충돌 설정은 플레이어 이동 컴포넌트가 이 태그를 보고 한 곳에서 바꾼다.
 	if (bEnable)
 	{
-		ASC->AddLooseGameplayTag(LOAGameplayTags::State_PassThroughBodyBlock);
+		ASC->AddLooseGameplayTag(LOAGameplayTags::State_Body_PassThroughBodyBlock);
 	}
 	else
 	{
-		ASC->RemoveLooseGameplayTag(LOAGameplayTags::State_PassThroughBodyBlock);
+		ASC->RemoveLooseGameplayTag(LOAGameplayTags::State_Body_PassThroughBodyBlock);
 	}
 	bPassThroughActive = bEnable;
 }

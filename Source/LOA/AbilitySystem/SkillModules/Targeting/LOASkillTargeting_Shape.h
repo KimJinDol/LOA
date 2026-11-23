@@ -14,6 +14,8 @@
 //           Angle             90             ← Fan만: 전체 각도
 //           Inner Radius      0              ← Fan만: 안쪽 빈 곳 (도넛)
 //           Length / Width    800 / 200      ← Box만: 앞 길이 / 좌우 폭
+//           Half Height       700            ← 높이 범위: 기준점에서 위아래로 각각 (모든 모양. 띄워진 플레이어도 이 안이면 맞음)
+//           Snap To Ground    ☑              ← 기준점을 발밑 바닥으로 (끄면 공격자 높이 그대로)
 //        Filter        [ Enemy ▼ ]     Enemy / Ally(나 제외) / Ally And Self(나 포함, 범위 안일 때만)
 //        Hit Judge     [ Server ▼ ]    누가 판정하나 (플레이어가 맞을 때만 차이). Server / Victim. 아래 [판정 방식]
 //        Object Type   Pawn
@@ -31,14 +33,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // [흐름] (판정 코드는 ULOACombatLibrary에 있다. 여기는 순서만)
 //   ① FindTargetsInShape(기준 액터, Shape, Filter)   → 모양 안의 대상
-//   ② 대상마다 MakeClosestHitResult(대상, 기준점)    → 맞은 지점 (대상 캡슐 표면에서 기준점과 가장 가까운 점)
+//   ② 대상마다 MakeShapeHitResult(대상, 기준점)      → 맞은 지점 (대상 캡슐 표면에서 기준점과 가장 가까운 점, 높이는 몸 가운데)
 //      기준점 = Sphere의 중심 / Fan의 꼭짓점 / Box의 뒷변 가운데
 //   ③ OutHits에 추가
 //
 // [판정 방식] Hit Judge
 //   Server (기본) : 서버가 서버의 위치로. 즉사기·파티 전멸기·기믹 실패
 //   Victim        : 맞는 플레이어의 컴퓨터가 자기 화면 위치로. 일반·빠른 패턴 ("내 화면에서 피했으면 안 맞음")
-//   이 칸을 읽고 실제로 판정하는 건 ULOAHitJudgeSubsystem. 부르는 쪽(Apply 모듈, 장판 액터)은 판정 방식을 모른다.
+//   이 칸을 읽고 판정 방식을 고르는 건 판정 매니저(ULOACombatJudgeManagerSubsystem). 부르는 쪽(Apply 모듈, 장판 액터)은 판정 방식을 모른다.
 //   몬스터·허수아비·리슨 호스트 본인은 Victim이어도 서버가 바로 판정한다. (원격 플레이어만 보고를 받는다)
 //
 // [커서 지점 범위 공격]
@@ -72,6 +74,12 @@ public:
 	//~ Begin ULOASkillTargeting Interface
 	virtual void FindTargets(const FLOASkillModuleContext& Context, TArray<FLOATargetHit>& OutHits) const override;
 
+	/** 모양 기준점 (GetShapeCenter: Sphere 중심 / Fan 꼭짓점 / Box 뒷변 가운데). 피해자 판정 요청의 ShapeCenter와 같은 값 */
+	virtual FVector GetAttackOrigin(const AActor* Source) const override;
+
+	/** 모양 + Filter를 그대로 내준다 (2026-11-02) */
+	virtual bool GetRange(FLOAHitShape& OutShape, ELOATargetFilter& OutFilter) const override;
+
 #if WITH_EDITOR
 	/** [에디터 전용] 저장 시 검사: Fan의 Inner Radius가 Radius보다 작은지 */
 	virtual EDataValidationResult ValidateTargeting(class FDataValidationContext& Context, const FString& Prefix) const override;
@@ -81,10 +89,10 @@ public:
 	/** 판정 모양. 범위 액터(ALOAAreaActor)가 같은 모양으로 예고를 띄우려고 읽는다. */
 	const FLOAHitShape& GetShape() const { return Shape; }
 
-	/** 누구를 고르나. 판정 담당이 피해자 판정 때 "보고를 받을 플레이어"를 고르려고 읽는다. (예: Enemy → 시전자의 적만) */
+	/** 누구를 고르나. 피해자 판정(ULOAVictimJudgeSubsystem)이 "보고를 받을 플레이어"를 고르려고 읽는다. (예: Enemy → 시전자의 적만) */
 	ELOATargetFilter GetFilter() const { return Filter; }
 
-	/** 누가 판정하나. 판정 담당(ULOAHitJudgeSuGbsystem)이 읽는다. */
+	/** 누가 판정하나. 판정 매니저(ULOACombatJudgeManagerSubsystem)가 읽는다. */
 	ELOAHitJudgeMode GetHitJudge() const { return HitJudge; }
 
 protected:
@@ -104,6 +112,9 @@ protected:
 	 * 누가 판정하나. 플레이어가 맞을 때만 차이가 난다. (몬스터·허수아비는 항상 서버)
 	 *   Server (기본) : 즉사기·기믹. 지연만큼 늦은 위치로 판정해서 내 화면에서 피했어도 맞을 수 있다.
 	 *   Victim        : 일반·빠른 패턴. 맞는 플레이어 화면 기준. 보고가 1초 안에 안 오면 서버 판정 결과를 쓴다.
+	 *   ※ 예고가 꽉 차는 순간을 보고 피하는 장판(ALOAAreaActor, Hit Timing = Telegraph)은 항상 서버 판정 (예고를 앞당겨 그리므로 화면대로. 2026-10-29)
+	 *     Victim으로 두면 장판 BP 저장 시 오류 (ALOAAreaActor::IsDataValid)
+	 *     → Victim은 보스 모션을 보고 피하는 공격(Apply 모듈, 예고 없는 장판, 빨간 구역만 보여 주는 장판 = Hit Timing Animation)에만 의미가 있다
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "Shape")
 	ELOAHitJudgeMode HitJudge = ELOAHitJudgeMode::Server;

@@ -2,7 +2,7 @@
 // [배관] 경직. 플레이어가 경직 태그를 받으면 자동으로 발동한다 (키로 발동하지 않음). 모든 직업 공용.
 //
 // ─────────────────────────────────────────────────────────────────────────────
-// [흐름] (전부 서버)  예) 보스 휘두르기, GE_CC_Paralysis { Duration 0.5, LaunchDistance 100 }
+// [흐름] (서버 기준. 맞은 사람 컴퓨터가 하는 일은 아래 [네트워크])  예) 보스 휘두르기, GE_CC_Paralysis { Duration 0.5, LaunchDistance 100 }
 //
 //   B가 맞음 → GE_CC_Paralysis → B에게 State.CrowdControl.Paralysis → 이 Ability 발동 (Trigger = 태그가 붙음)
 //     (슈퍼아머·피격 이상 면역·띄움 중이면 GE의 Ignore 조건에 걸려 여기까지 오지 않는다 → 아무 반응 없음)
@@ -20,10 +20,13 @@
 //   GE의 시간(기본 5초)은 끝 신호를 놓쳐도 태그가 남지 않게 하는 안전용이다.
 //
 // ─────────────────────────────────────────────────────────────────────────────
-// [네트워크]
-//   1. 서버만     : 발동, 취소, 밀 숫자 정하기, 끝나는 시각
-//   2. 복제       : 경직·이동 금지 태그 (GE), 몽타주, 밀 숫자 (이동 컴포넌트의 CrowdControlMove, B에게만)
+// [네트워크] (2026-10-23 바꿈: ServerOnly → ServerInitiated. 이유는 ULOAGA_Airborne 헤더 [네트워크]와 같음:
+//             엔진이 "내가 조종하는 캐릭터"의 복제 몽타주를 버려서 B 화면에서만 경직 모션이 안 나왔다)
+//   발동·끝내기는 서버만. 서버가 발동하면 B 컴퓨터에서도 이 GA가 돌고, B 컴퓨터는 몽타주만 맡는다.
+//   1. 서버만     : 이동 금지 GE, 밀 숫자 정하기, 또 맞음 판단(옛 GE 지우기), 끝나는 시각, 정리
+//   2. 복제       : 경직·이동 금지 태그 (GE), 밀 숫자 (이동 컴포넌트의 CrowdControlMove, B에게만), 남의 화면용 몽타주
 //   3. 각자 할 일 : 궤적 걸기, 때린 쪽 바라보기 (서버와 B 컴퓨터가 같은 숫자로)
+//                   B 컴퓨터의 이 GA: 다른 스킬 끊기, 몽타주, 새 경직 GE가 복제로 도착하면 몽타주 처음부터
 //   대가: B 화면에서 핑만큼 늦게 밀린다 (띄움과 같음)
 //
 // ─────────────────────────────────────────────────────────────────────────────
@@ -82,8 +85,11 @@ private:
 	/** 때린 쪽 반대로 Distance만큼, Push Duration 동안 밀리는 궤적을 건다 (서버) */
 	void PushFromEffect(const FGameplayEffectSpec& Spec, float Distance);
 
-	/** 경직 몽타주를 처음부터 튼다. 또 맞을 때도 새로 다시 튼다 (이미 끝났어도 나오게) */
-	void PlayParalysisMontage();
+	/**
+	 * 경직 몽타주를 처음부터 튼다. 또 맞을 때도 새로 다시 튼다 (이미 끝났어도 나오게)
+	 * @param StartTimeSeconds  이 위치부터 (예측 피격 반응을 이어받을 때. ULOACrowdControlPredictionComponent)
+	 */
+	void PlayParalysisMontage(float StartTimeSeconds = 0.f);
 
 	/** 지금 경직 몽타주를 트는 작업. 또 맞으면 끝내고 새로 */
 	TWeakObjectPtr<UAbilityTask_PlayMontageAndWait> MontageTask;
@@ -100,6 +106,15 @@ private:
 	/** 경직 시간이 끝남 → 정상 종료 */
 	void OnParalysisTimeFinished();
 
+	/**
+	 * [B 컴퓨터] 경직 GE가 복제로 도착함. 이번 발동의 첫 GE면 기억만, 그다음부터는 "또 맞음" → 몽타주 처음부터.
+	 * (서버의 OnEffectAppliedToSelf는 B 컴퓨터에서 울리지 않는다. 복제 도착은 이 알림으로 온다)
+	 */
+	void OnEffectAddedOnOwner(UAbilitySystemComponent* TargetASC, const FGameplayEffectSpec& Spec, FActiveGameplayEffectHandle ActiveHandle);
+
+	/** 서버에서 도는 GA인가 (리슨 호스트 포함). 아니면 맞은 사람(B) 컴퓨터 */
+	bool IsServerSide() const;
+
 	/** 내가 서버에서 붙인 GE를 지운다 (번호표를 비움) */
 	void RemoveOwnedEffect(FActiveGameplayEffectHandle& InOutHandle) const;
 
@@ -115,4 +130,10 @@ private:
 	/** 알림 구독 번호 (종료 때 해제) */
 	FDelegateHandle EffectAppliedHandle;
 	FDelegateHandle ParalysisTagHandle;
+
+	/** [B 컴퓨터] 경직 GE 도착 알림 번호 */
+	FDelegateHandle EffectAddedHandleOnOwner;
+
+	/** [B 컴퓨터] 이번 발동의 첫 경직 GE를 이미 봤나. (발동 RPC와 GE 복제 중 어느 쪽이 먼저 와도 첫 GE로 다시 틀지 않게) */
+	bool bOwnerSawFirstEffect = false;
 };

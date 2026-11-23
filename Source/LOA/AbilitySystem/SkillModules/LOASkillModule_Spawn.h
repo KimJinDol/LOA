@@ -123,6 +123,9 @@ protected:
 	//~ End ULOASkillModule Interface
 
 public:
+	/** 대상에게 줄 GE들 (툴팁이 읽음, 2026-11-14) */
+	virtual const TArray<FLOAEffectPayload>* GetPayloads() const override { return &Payloads; }
+
 #if WITH_EDITOR
 	/**
 	 * [에디터 전용] 저장 시 검사. (부모의 Trigger 검사 + 아래)

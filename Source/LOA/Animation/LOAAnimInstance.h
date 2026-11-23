@@ -7,7 +7,8 @@
 // AnimBP가 그 상태를 알려면 ASC 태그를 봐야 한다. 매 프레임 직접 묻는 대신 엔진 기능으로 자동 연결한다.
 //
 //   GameplayTagPropertyMap (Class Defaults에서 설정)
-//     State.Dead  →  bIsDead (AnimBP 변수)
+//     State.Body.Dead                    →  bIsDead (AnimBP 변수)
+//     State.CrowdControl.Status.Stunned  →  bIsStunned (플레이어 스턴 자세, 2026-11-10. 스턴 GA는 몽타주 없이)
 //   태그가 붙으면 bIsDead = true, 떨어지면 false. 코드는 태그 이름도 변수 이름도 모른다. (데이터)
 //
 // 엔진의 FGameplayTagBlueprintPropertyMap을 쓴다. (Lyra의 AnimInstance와 같은 방식)
@@ -17,7 +18,7 @@
 // [흐름]
 //   몸(보스 / 나중에 플레이어)이 자기 ASC가 준비된 직후 InitializeWithAbilitySystem(ASC)를 부른다.
 //     보스      : BeginPlay에서 InitAbilityActorInfo 바로 다음
-//     플레이어  : (나중에) TryFinalizeInitialization 마지막
+//     플레이어  : TryFinalizeInitialization (외형 적용 뒤)
 //   → 이때 지금 태그 상태로 변수를 한 번 채우고, 이후 태그가 바뀔 때마다 갱신한다.
 //   → 늦게 들어온 플레이어도 이미 붙은 State.Dead를 보고 바로 시체 포즈가 된다.
 //
@@ -31,7 +32,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // [BP에서 설정할 것] ABP_<이름> (부모: LOAAnimInstance)
 //   ① AnimBP 변수 추가: bIsDead (bool)
-//   ② Class Defaults → LOA|Anim → Gameplay Tag Property Map: [State.Dead → bIsDead]
+//   ② Class Defaults → LOA|Anim → Gameplay Tag Property Map: [State.Body.Dead → bIsDead]
 //   ③ 상태 머신: 아무 상태 → Dead (조건 bIsDead). Dead 상태 = 사망 애니 (Loop 끔 → 마지막 프레임 유지)
 
 #pragma once
@@ -63,7 +64,7 @@ public:
 protected:
 	/**
 	 * 태그 → AnimBP 변수 연결 목록.
-	 * 예) State.Dead → bIsDead
+	 * 예) State.Body.Dead → bIsDead
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "LOA|Anim")
 	FGameplayTagBlueprintPropertyMap GameplayTagPropertyMap;

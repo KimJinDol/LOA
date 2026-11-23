@@ -1,11 +1,17 @@
 // LOACombatLibrary.cpp
 
 #include "Library/LOACombatLibrary.h"
+#include "Library/LOACombatSettings.h"
+#include "AbilitySystem/LOAGameplayEffectContext.h"
+#include "AbilitySystem/Abilities/LOAGameplayAbility.h"
+#include "AbilitySystem/Attributes/LOAAttributeSet_Combat.h"
+#include "AbilitySystem/Attributes/LOAAttributeSet_Player.h"
+#include "AbilitySystem/Effects/LOAGE_InfiniteTags.h"
+#include "AbilitySystem/Effects/LOAGE_TimedTags.h"
 #include "Core/LOAGameplayTags.h"
 #include "Core/LOALog.h"
-#include "Combat/LOACombatRPCComponent.h"
-#include "GameFramework/PlayerController.h"
-#include "UI/Combat/DamageNumber/LOADamageNumberTypes.h"
+#include "Core/LOANetTime.h"
+#include "Core/LOACollisionChannels.h"
 
 #include "AbilitySystemComponent.h"
 #include "AbilitySystemGlobals.h"
@@ -212,8 +218,171 @@ FVector ULOACombatLibrary::GetShapeCenter(const AActor* Attacker, const FLOAHitS
 		return FVector::ZeroVector;
 	}
 
+	// 공격자의 지금 자리·방향으로 (규칙은 GetShapeCenterAt 한 곳)
+	return GetShapeCenterAt(Attacker->GetWorld(), Attacker->GetActorLocation(), Attacker->GetActorForwardVector(), Shape, Attacker);
+}
+
+FVector ULOACombatLibrary::GetShapeCenterAt(const UWorld* World, const FVector& AttackerLocation, const FVector& AttackerForward,
+	const FLOAHitShape& Shape, const AActor* IgnoreActor)
+{
 	// 중심 = 공격자 위치 + 앞 방향 × ForwardDistance
-	return Attacker->GetActorLocation() + Attacker->GetActorForwardVector() * Shape.ForwardDistance;
+	const FVector Center = AttackerLocation + AttackerForward * Shape.ForwardDistance;
+	if (!Shape.bSnapToGround)
+	{
+		return Center;
+	}
+
+	// 땅에 붙이기: 그 아래 바닥 높이로 (못 찾으면 그대로). 예) 보스 캡슐 중심(바닥 위 300)에서 소환 → 바닥
+	FVector Ground;
+	FindGroundLocation(World, Center, Ground, IgnoreActor);
+	return Ground;
+}
+
+namespace LOAGround
+{
+	/** 바닥 찾기 트레이스: 위로 이만큼에서 시작 (cm). Offset Z가 음수라 바닥보다 살짝 아래에서 시작해도 찾게 */
+	constexpr float TraceUp = 300.f;
+
+	/** 바닥 찾기 트레이스: 아래로 이만큼까지 (cm). 큰 보스 캡슐 중심 높이보다 넉넉히 */
+	constexpr float TraceDown = 2000.f;
+}
+
+bool ULOACombatLibrary::FindGroundLocation(const UWorld* World, const FVector& Location, FVector& OutGround, const AActor* IgnoreActor)
+{
+	OutGround = Location;
+	if (!World)
+	{
+		return false;
+	}
+
+	// 바닥(Ground 채널을 막는 것 = Floor 프로필)만. 캐릭터·보스 캡슐, 장애물 프랍, 벽은 안 본다 (2026-11-14, LOACollisionChannels.h [Ground])
+	//   → 보스 캡슐 안에서 시작해도 보스 몸에 걸리지 않고, 프랍 위에서 생긴 장판도 프랍 아래 바닥에 붙는다
+	//   (전에는 WorldStatic 물체 트레이스: 프랍 윗면에 붙고, WorldDynamic 바닥(BP에 붙인 메시)은 못 찾았다)
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(LOAFindGround), false, IgnoreActor);
+	FHitResult Hit;
+	const bool bFound = World->LineTraceSingleByChannel(
+		Hit,
+		Location + FVector(0.f, 0.f, LOAGround::TraceUp),
+		Location - FVector(0.f, 0.f, LOAGround::TraceDown),
+		LOACollision::Ground,
+		Params);
+	if (bFound)
+	{
+		OutGround.Z = Hit.ImpactPoint.Z;
+	}
+	return bFound;
+}
+
+// 모양 안의 대상 찾기 (네 함수 공통). 헤더 FindTargetsInShape [판정]
+namespace LOAShapeSearch
+{
+	/**
+	 * ① 후보: 모양을 덮는 "위아래로 긴 상자"로 겹침 검색 (높이 = 기준점 ± Shape.HalfHeight)
+	 *      Sphere / Fan : 기준점 중심, 가로세로 = 반지름 × 2 (부채꼴도 원을 덮는 상자. 각도는 ②에서)
+	 *      Box          : 직사각형 그대로 (중심 = 뒷변 가운데 + 앞으로 길이/2, 보는 방향으로 돌림)
+	 *    겹침 검색은 실제 충돌체 기준이라 몸이 상자에 걸친 대상까지 들어온다.
+	 * ② 후보마다: 맞을 수 있나(IsTargetable) / 편(PassesFilter) / 모양 안인가(IsBodyInShape = 바닥 모양 + 높이)
+	 *    → 서버 검색과 피해자 판정(클라)이 ②의 같은 함수로 같은 결과를 낸다
+	 */
+	int32 FindTargets(
+		const AActor* Source, const FLOAHitShape& Shape, const FVector& Center, float Yaw,
+		ELOATargetFilter Filter, TEnumAsByte<ECollisionChannel> ObjectType,
+		TArray<AActor*>& OutTargets, bool bShowRange, const AActor* Caster)
+	{
+		UWorld* World = Source ? Source->GetWorld() : nullptr;
+		if (!World)
+		{
+			return 0;
+		}
+
+		// 편 판단 기준 ("나"). 시전자를 따로 받았으면 그쪽, 아니면 범위 기준 액터 자신 (캐릭터가 직접 부를 때는 둘이 같다)
+		const AActor* FilterSource = Caster ? Caster : Source;
+		const float HalfHeight = FMath::Max(Shape.HalfHeight, 1.f);
+
+		// ① 후보 상자 (중심, 반 크기, 회전)
+		FVector BoxCenter = Center;
+		FVector BoxHalfExtent;
+		FQuat BoxRotation = FQuat::Identity;
+		switch (Shape.ShapeType)
+		{
+		case ELOAHitShapeType::Sphere:
+		case ELOAHitShapeType::Fan:
+			if (Shape.Radius <= 0.f)
+			{
+				return 0;
+			}
+			BoxHalfExtent = FVector(Shape.Radius, Shape.Radius, HalfHeight);
+			break;
+
+		case ELOAHitShapeType::Box:
+		{
+			if (Shape.Length <= 0.f || Shape.Width <= 0.f)
+			{
+				return 0;
+			}
+			const FRotator Facing(0.f, Yaw, 0.f);
+			BoxCenter = Center + Facing.Vector() * (Shape.Length * 0.5f);
+			BoxHalfExtent = FVector(Shape.Length * 0.5f, Shape.Width * 0.5f, HalfHeight);
+			BoxRotation = Facing.Quaternion();
+			break;
+		}
+
+		default:
+			// 새 모양을 Enum에만 추가하고 여기를 빼먹으면 알 수 있게
+			ensureMsgf(false, TEXT("FindTargetsInShape: unknown shape type %d"), static_cast<int32>(Shape.ShapeType));
+			return 0;
+		}
+
+		// 나 자신도 검색에 포함한다. (AllyAndSelf가 나를 찾아야 하므로) 뺄지 말지는 ②의 Filter가 정한다.
+		TArray<FOverlapResult> Overlaps;
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(LOAFindTargetsInShape), false);
+		World->OverlapMultiByObjectType(
+			Overlaps,
+			BoxCenter,
+			BoxRotation,
+			FCollisionObjectQueryParams(ObjectType),
+			FCollisionShape::MakeBox(BoxHalfExtent),
+			Params);
+
+		// 목록에 원래 들어 있던 개수. "이번에 새로 찾은 수"를 계산하는 데 쓴다.
+		// (범위 여러 개를 한 목록에 이어서 모을 때: 앞쪽 원 + 주변 원 등)
+		const int32 NumBefore = OutTargets.Num();
+
+		for (const FOverlapResult& Overlap : Overlaps)
+		{
+			AActor* Target = Overlap.GetActor();
+
+			// ② 중복 제외 (한 액터에 콜리전이 여러 개여도 한 번만) / 맞을 수 있나 (ASC 있음 + 죽지 않음) / 편
+			if (!Target || OutTargets.Contains(Target)
+				|| !ULOACombatLibrary::IsTargetable(Target)
+				|| !ULOACombatLibrary::PassesFilter(FilterSource, Target, Filter))
+			{
+				continue;
+			}
+
+			// ② 모양 안인가 (바닥 모양 + 높이). 몸통 = 충돌 캡슐 (반지름, 반 높이)
+			if (ULOACombatLibrary::IsBodyInShape(Shape, Center, Yaw,
+				Target->GetActorLocation(), Target->GetSimpleCollisionRadius(), Target->GetSimpleCollisionHalfHeight()))
+			{
+				OutTargets.Add(Target);
+			}
+		}
+
+		const int32 NumFound = OutTargets.Num() - NumBefore;
+
+#if ENABLE_DRAW_DEBUG
+		// 이 함수를 부른 월드(보통 서버)에 그린다.
+		// - 스탠드얼론 / 리슨 서버 호스트 : 그 화면에 보인다.
+		// - PIE 한 프로세스 실행 + 데디케이티드 서버 : 엔진이 같은 프로세스의 클라이언트 창에 대신 그려 준다. (에디터 전용 편의 기능)
+		// - 실제 데디케이티드 서버(패키징) : 보이지 않는다.
+		if (bShowRange)
+		{
+			ULOACombatLibrary::DrawDebugHitShape(World, Shape, Center, Yaw, NumFound > 0 ? FColor::Red : FColor::Green);
+		}
+#endif
+
+		return NumFound;
+	}
 }
 
 int32 ULOACombatLibrary::FindTargetsInShape(
@@ -232,28 +401,8 @@ int32 ULOACombatLibrary::FindTargetsInShape(
 
 	// 모든 모양 공통 기준점 (Sphere = 중심, Fan = 꼭짓점, Box = 뒷변 가운데)
 	// 이 시점의 기준 액터는 이미 커서 방향으로 돌아 있다. → 앞 방향 = 스킬 방향
-	const FVector Center = GetShapeCenter(Source, Shape);
-
-	// 모양에 맞는 함수 고르기. 모양을 추가하면 여기에 case를 추가한다.
-	switch (Shape.ShapeType)
-	{
-	case ELOAHitShapeType::Sphere:
-		return FindTargetsInSphere(Source, Center, Shape.Radius, Filter, ObjectType, OutTargets, bShowRange, Caster, Shape.bHitByBody);
-
-	case ELOAHitShapeType::Fan:
-		return FindTargetsInFan(Source, Center, Source->GetActorForwardVector(),
-			Shape.Radius, Shape.InnerRadius, Shape.Angle, Filter, ObjectType, OutTargets, bShowRange, Caster, Shape.bHitByBody);
-
-	case ELOAHitShapeType::Box:
-		// 기준점 = 뒷변 가운데. 기준 액터의 앞 방향으로 뻗는다.
-		return FindTargetsInBox(Source, Center, Source->GetActorForwardVector(),
-			Shape.Length, Shape.Width, Filter, ObjectType, OutTargets, bShowRange, Caster, Shape.bHitByBody);
-
-	default:
-		// 새 모양을 Enum에만 추가하고 여기를 빼먹으면 알 수 있게
-		ensureMsgf(false, TEXT("FindTargetsInShape: unknown shape type %d"), static_cast<int32>(Shape.ShapeType));
-		return 0;
-	}
+	return LOAShapeSearch::FindTargets(Source, Shape, GetShapeCenter(Source, Shape), Source->GetActorRotation().Yaw,
+		Filter, ObjectType, OutTargets, bShowRange, Caster);
 }
 
 int32 ULOACombatLibrary::FindTargetsInSphere(
@@ -267,76 +416,12 @@ int32 ULOACombatLibrary::FindTargetsInSphere(
 	const AActor* Caster,
 	bool bHitByBody)
 {
-	UWorld* World = Source ? Source->GetWorld() : nullptr;
-	if (!World || Radius <= 0.f)
-	{
-		return 0;
-	}
-
-	// 편 판단 기준 ("나"). 시전자를 따로 받았으면 그쪽, 아니면 범위 기준 액터 자신 (캐릭터가 직접 부를 때는 둘이 같다)
-	const AActor* FilterSource = Caster ? Caster : Source;
-
-	// ① 구 범위 안의 ObjectType 물체 검색.
-	//    나 자신도 검색에 포함한다. (AllyAndSelf가 나를 찾아야 하므로) 뺄지 말지는 ④의 Filter가 정한다.
-	TArray<FOverlapResult> Overlaps;
-	FCollisionQueryParams Params(SCENE_QUERY_STAT(LOAFindTargetsInSphere), false);
-	World->OverlapMultiByObjectType(
-		Overlaps,
-		Center,
-		FQuat::Identity,
-		FCollisionObjectQueryParams(ObjectType),
-		FCollisionShape::MakeSphere(Radius),
-		Params);
-
-	// 목록에 원래 들어 있던 개수. "이번에 새로 찾은 수"를 계산하는 데 쓴다.
-	// (범위 여러 개를 한 목록에 이어서 모을 때: 앞쪽 원 + 주변 원 등)
-	const int32 NumBefore = OutTargets.Num();
-
-	for (const FOverlapResult& Overlap : Overlaps)
-	{
-		AActor* Target = Overlap.GetActor();
-
-		// ② 중복 제외 (한 액터에 콜리전이 여러 개여도 한 번만)
-		if (!Target || OutTargets.Contains(Target))
-		{
-			continue;
-		}
-
-		// ③ 맞을 수 있는 대상인가 (ASC 있음 + 죽지 않음). 벽, 소품, 시체 제외
-		if (!IsTargetable(Target))
-		{
-			continue;
-		}
-
-		// ④ 편 거르기 (적 / 나를 뺀 아군 / 나를 포함한 아군)
-		if (!PassesFilter(FilterSource, Target, Filter))
-		{
-			continue;
-		}
-
-		// ⑤ 발 기준이면: 겹침 검색은 몸통 기준이라 걸치기만 한 대상도 들어온다. → 중심점이 원 안(바닥 거리)인지 다시 본다.
-		if (!bHitByBody && FVector::DistSquared2D(Center, Target->GetActorLocation()) > FMath::Square(Radius))
-		{
-			continue;
-		}
-
-		OutTargets.Add(Target);
-	}
-
-	const int32 NumFound = OutTargets.Num() - NumBefore;
-
-#if ENABLE_DRAW_DEBUG
-	// 이 함수를 부른 월드(보통 서버)에 그린다.
-	// - 스탠드얼론 / 리슨 서버 호스트 : 그 화면에 보인다.
-	// - PIE 한 프로세스 실행 + 데디케이티드 서버 : 엔진이 같은 프로세스의 클라이언트 창에 대신 그려 준다. (에디터 전용 편의 기능)
-	// - 실제 데디케이티드 서버(패키징) : 보이지 않는다.
-	if (bShowRange)
-	{
-		DrawDebugSphere(World, Center, Radius, 16, NumFound > 0 ? FColor::Red : FColor::Green, false, 1.f);
-	}
-#endif
-
-	return NumFound;
+	// 모양을 만들어 공통 함수로 (높이는 FLOAHitShape 기본값)
+	FLOAHitShape Shape;
+	Shape.ShapeType = ELOAHitShapeType::Sphere;
+	Shape.Radius = Radius;
+	Shape.bHitByBody = bHitByBody;
+	return LOAShapeSearch::FindTargets(Source, Shape, Center, 0.f, Filter, ObjectType, OutTargets, bShowRange, Caster);
 }
 
 int32 ULOACombatLibrary::FindTargetsInFan(
@@ -353,60 +438,19 @@ int32 ULOACombatLibrary::FindTargetsInFan(
 	const AActor* Caster,
 	bool bHitByBody)
 {
-	UWorld* World = Source ? Source->GetWorld() : nullptr;
-	if (!World || Radius <= 0.f || InnerRadius >= Radius)
-	{
-		return 0;
-	}
-
 	// 방향은 바닥 기준 (높이 무시). 방향이 없으면(위/아래만 향함) 판정할 수 없다.
-	const FVector Forward2D = FVector(Direction.X, Direction.Y, 0.f).GetSafeNormal();
-	if (Forward2D.IsNearlyZero())
+	if (FVector(Direction.X, Direction.Y, 0.f).IsNearlyZero())
 	{
 		return 0;
 	}
 
-	const float HalfAngleRad = FMath::DegreesToRadians(FMath::Clamp(Angle, 1.f, 360.f) * 0.5f);
-	const float SafeInnerRadius = FMath::Max(InnerRadius, 0.f);
-
-	// ① 후보: 꼭짓점 중심, 반지름 Radius 구. ASC / Filter / 중복은 구 검색이 이미 거른다.
-	//    (구 검색은 실제 충돌체 기준이라 몸이 구에 걸친 대상까지 들어온다)
-	//    범위 그리기는 구가 아니라 아래에서 부채꼴로 그린다.
-	TArray<AActor*> Candidates;
-	FindTargetsInSphere(Source, Apex, Radius, Filter, ObjectType, Candidates, false, Caster);
-
-	const int32 NumBefore = OutTargets.Num();
-
-	for (AActor* Target : Candidates)
-	{
-		// 이미 목록에 있으면 넣지 않는다. (범위 여러 개를 한 목록에 이어서 모을 때)
-		if (!Target || OutTargets.Contains(Target))
-		{
-			continue;
-		}
-
-		// ② 몸통 원이 부채꼴에 걸치는가. 몸통 반지름 = 충돌 캡슐 반지름 (캐릭터/보스)
-		//    발 기준이면 몸통 반지름 0 = 중심점이 부채꼴 안인가
-		const float BodyRadius = bHitByBody ? Target->GetSimpleCollisionRadius() : 0.f;
-		if (LOAFan::DoesBodyOverlapFan(Apex, Forward2D, HalfAngleRad, Radius, SafeInnerRadius,
-			Target->GetActorLocation(), BodyRadius))
-		{
-			OutTargets.Add(Target);
-		}
-	}
-
-	const int32 NumFound = OutTargets.Num() - NumBefore;
-
-#if ENABLE_DRAW_DEBUG
-	// 그려지는 화면은 FindTargetsInSphere와 같다. (스탠드얼론 / 리슨 호스트 / PIE 데디는 보임, 실제 데디는 안 보임)
-	if (bShowRange)
-	{
-		LOAFan::DrawDebugFan(World, Apex, Forward2D, HalfAngleRad, Radius, SafeInnerRadius,
-			NumFound > 0 ? FColor::Red : FColor::Green);
-	}
-#endif
-
-	return NumFound;
+	FLOAHitShape Shape;
+	Shape.ShapeType = ELOAHitShapeType::Fan;
+	Shape.Radius = Radius;
+	Shape.InnerRadius = InnerRadius;
+	Shape.Angle = Angle;
+	Shape.bHitByBody = bHitByBody;
+	return LOAShapeSearch::FindTargets(Source, Shape, Apex, Direction.Rotation().Yaw, Filter, ObjectType, OutTargets, bShowRange, Caster);
 }
 
 int32 ULOACombatLibrary::FindTargetsInBox(
@@ -422,69 +466,37 @@ int32 ULOACombatLibrary::FindTargetsInBox(
 	const AActor* Caster,
 	bool bHitByBody)
 {
-	UWorld* World = Source ? Source->GetWorld() : nullptr;
-	if (!World || Length <= 0.f || Width <= 0.f)
-	{
-		return 0;
-	}
-
 	// 방향은 바닥 기준 (높이 무시). 방향이 없으면(위/아래만 향함) 판정할 수 없다.
-	const FVector Forward2D = FVector(Direction.X, Direction.Y, 0.f).GetSafeNormal();
-	if (Forward2D.IsNearlyZero())
+	if (FVector(Direction.X, Direction.Y, 0.f).IsNearlyZero())
 	{
 		return 0;
 	}
 
-	const float HalfWidth = Width * 0.5f;
-
-	// ① 후보: 직사각형을 다 덮는 구. 중심 = 직사각형 중심, 반지름 = 대각선의 절반.
-	//    ASC / Filter / 중복은 구 검색이 이미 거른다. 범위 그리기는 구가 아니라 아래에서 직사각형으로 그린다.
-	const FVector BoxCenter = Start + Forward2D * (Length * 0.5f);
-	const float CoverRadius = FMath::Sqrt(FMath::Square(Length * 0.5f) + FMath::Square(HalfWidth));
-
-	TArray<AActor*> Candidates;
-	FindTargetsInSphere(Source, BoxCenter, CoverRadius, Filter, ObjectType, Candidates, false, Caster);
-
-	const int32 NumBefore = OutTargets.Num();
-
-	for (AActor* Target : Candidates)
-	{
-		// 이미 목록에 있으면 넣지 않는다. (범위 여러 개를 한 목록에 이어서 모을 때)
-		if (!Target || OutTargets.Contains(Target))
-		{
-			continue;
-		}
-
-		// ② 몸통 원이 직사각형에 걸치는가. 몸통 반지름 = 충돌 캡슐 반지름 (캐릭터/보스)
-		//    발 기준이면 몸통 반지름 0 = 중심점이 직사각형 안인가
-		const float BodyRadius = bHitByBody ? Target->GetSimpleCollisionRadius() : 0.f;
-		if (LOABox::DoesBodyOverlapBox(Start, Forward2D, Length, HalfWidth, Target->GetActorLocation(), BodyRadius))
-		{
-			OutTargets.Add(Target);
-		}
-	}
-
-	const int32 NumFound = OutTargets.Num() - NumBefore;
-
-#if ENABLE_DRAW_DEBUG
-	// 그려지는 화면은 FindTargetsInSphere와 같다. (스탠드얼론 / 리슨 호스트 / PIE 데디는 보임, 실제 데디는 안 보임)
-	if (bShowRange)
-	{
-		LOABox::DrawDebugBox2D(World, Start, Forward2D, Length, HalfWidth, NumFound > 0 ? FColor::Red : FColor::Green);
-	}
-#endif
-
-	return NumFound;
+	FLOAHitShape Shape;
+	Shape.ShapeType = ELOAHitShapeType::Box;
+	Shape.Length = Length;
+	Shape.Width = Width;
+	Shape.bHitByBody = bHitByBody;
+	return LOAShapeSearch::FindTargets(Source, Shape, Start, Direction.Rotation().Yaw, Filter, ObjectType, OutTargets, bShowRange, Caster);
 }
 
 bool ULOACombatLibrary::IsBodyInShape(const FLOAHitShape& Shape, const FVector& ShapeCenter, float Yaw,
-	const FVector& BodyLocation, float BodyRadius)
+	const FVector& BodyLocation, float BodyRadius, float BodyHalfHeight)
 {
 	// 방향 (바닥 기준, 길이 1)
 	const FVector Forward2D = FRotator(0.f, Yaw, 0.f).Vector().GetSafeNormal2D();
 
-	// 몸통 기준이면 몸통 반지름만큼 넓게, 발 기준이면 중심점만
+	// 몸통 기준이면 몸통 반지름·반 높이만큼 넓게, 발 기준이면 중심점만
 	const float HitRadius = Shape.bHitByBody ? FMath::Max(BodyRadius, 0.f) : 0.f;
+	const float HitHalfHeight = Shape.bHitByBody ? FMath::Max(BodyHalfHeight, 0.f) : 0.f;
+
+	// ① 높이: 몸의 위아래가 "기준점 ± HalfHeight"에 걸치는가 (띄워진 플레이어도 이 안이면 맞음. 다른 층은 안 맞음)
+	if (FMath::Abs(BodyLocation.Z - ShapeCenter.Z) > FMath::Max(Shape.HalfHeight, 0.f) + HitHalfHeight)
+	{
+		return false;
+	}
+
+	// ② 바닥 모양 (위에서 본 XY)
 
 	switch (Shape.ShapeType)
 	{
@@ -554,25 +566,34 @@ void ULOACombatLibrary::DrawDebugHitShape(const UWorld* World, const FLOAHitShap
 	}
 
 	const FVector Forward2D = FRotator(0.f, Yaw, 0.f).Vector().GetSafeNormal2D();
+
+	// 바닥에서 조금 띄워 그린다. 기준점이 바닥(bSnapToGround)이면 선이 바닥과 겹쳐 지직거린다 (그림만. 판정은 그대로)
+	constexpr float DrawLift = 10.f;
+	const FVector DrawCenter = ShapeCenter + FVector(0.f, 0.f, DrawLift);
+
 	switch (Shape.ShapeType)
 	{
 	case ELOAHitShapeType::Sphere:
 		// 판정이 바닥 거리라 바닥 원으로 그린다.
-		DrawDebugCircle(World, ShapeCenter, Shape.Radius, 48, Color, false, 1.f, 0, 2.f, FVector::ForwardVector, FVector::RightVector, false);
+		DrawDebugCircle(World, DrawCenter, Shape.Radius, 48, Color, false, 1.f, 0, 2.f, FVector::ForwardVector, FVector::RightVector, false);
 		break;
 
 	case ELOAHitShapeType::Fan:
-		LOAFan::DrawDebugFan(World, ShapeCenter, Forward2D, FMath::DegreesToRadians(FMath::Clamp(Shape.Angle, 1.f, 360.f) * 0.5f),
+		LOAFan::DrawDebugFan(World, DrawCenter, Forward2D, FMath::DegreesToRadians(FMath::Clamp(Shape.Angle, 1.f, 360.f) * 0.5f),
 			Shape.Radius, FMath::Max(Shape.InnerRadius, 0.f), Color);
 		break;
 
 	case ELOAHitShapeType::Box:
-		LOABox::DrawDebugBox2D(World, ShapeCenter, Forward2D, Shape.Length, Shape.Width * 0.5f, Color);
+		LOABox::DrawDebugBox2D(World, DrawCenter, Forward2D, Shape.Length, Shape.Width * 0.5f, Color);
 		break;
 
 	default:
 		break;
 	}
+
+	// 높이 범위: 기준점에서 위아래 HalfHeight 세로선
+	const FVector HeightOffset(0.f, 0.f, FMath::Max(Shape.HalfHeight, 0.f));
+	DrawDebugLine(World, ShapeCenter - HeightOffset, ShapeCenter + HeightOffset, Color, false, 1.f, 0, 2.f);
 #endif
 }
 
@@ -590,13 +611,13 @@ bool ULOACombatLibrary::IsTargetable(const AActor* Target)
 	}
 
 	// ② 살아 있는가. State.Dead는 GA_Death가 붙이고 모든 컴퓨터에 복제된다.
-	if (ASC->HasMatchingGameplayTag(LOAGameplayTags::State_Dead))
+	if (ASC->HasMatchingGameplayTag(LOAGameplayTags::State_Body_Dead))
 	{
 		return false;
 	}
 
-	// ③ 몸이 있는가. State.Hidden = 하늘로 사라진 보스 등 (LOA Grant Tags 구간)
-	return !ASC->HasMatchingGameplayTag(LOAGameplayTags::State_Hidden);
+	// ③ 몸이 있는가. State.Body.Hidden = 하늘로 사라진 보스 등 (LOA Grant Tags 구간)
+	return !ASC->HasMatchingGameplayTag(LOAGameplayTags::State_Body_Hidden);
 }
 
 int32 ULOACombatLibrary::FindLivingEnemyPlayers(const AActor* Source, TArray<AActor*>& OutEnemies)
@@ -632,38 +653,249 @@ bool ULOACombatLibrary::IsEnemy(const AActor* A, const AActor* B)
 		return false;
 	}
 
-	// [임시 규칙] PlayerState가 있는 Pawn = 플레이어 편
-	auto IsPlayerSide = [](const AActor* Actor)
-	{
-		const APawn* Pawn = Cast<APawn>(Actor);
-		return Pawn && Pawn->GetPlayerState() != nullptr;
-	};
-
-	// 편이 다르면 적
+	// 편이 다르면 적 (편 = IsPlayerSide의 임시 규칙)
 	return IsPlayerSide(A) != IsPlayerSide(B);
 }
 
-bool ULOACombatLibrary::IsHeadAttack(const AActor* Target, const AActor* Attacker, float HalfAngleDegrees)
+bool ULOACombatLibrary::IsPlayerSide(const AActor* Actor)
 {
-	if (!Target || !Attacker || Target == Attacker)
+	// [임시 규칙] PlayerState가 있는 Pawn = 플레이어 편
+	const APawn* Pawn = Cast<APawn>(Actor);
+	return Pawn && Pawn->GetPlayerState() != nullptr;
+}
+
+float ULOACombatLibrary::GetFacingAngleTo(const FVector& From, const FVector& Forward, const FVector& Point)
+{
+	// 바닥 기준: From → Point 방향과 보는 방향 (높이 무시)
+	const FVector ToPoint = (Point - From).GetSafeNormal2D();
+	const FVector Facing = Forward.GetSafeNormal2D();
+	if (ToPoint.IsNearlyZero() || Facing.IsNearlyZero())
 	{
-		return false;
+		return 0.f;	// 같은 자리 → 방향 없음
 	}
 
-	// 바닥 기준: 맞은 쪽 → 때린 사람 방향과 맞은 쪽이 보는 방향 (높이 무시)
-	const FVector ToAttacker = (Attacker->GetActorLocation() - Target->GetActorLocation()).GetSafeNormal2D();
-	const FVector Forward = Target->GetActorForwardVector().GetSafeNormal2D();
+	// 두 방향의 내적 = cos(사이 각) → 각도
+	const float Dot = FMath::Clamp(FVector::DotProduct(Facing, ToPoint), -1.f, 1.f);
+	return FMath::RadiansToDegrees(FMath::Acos(Dot));
+}
 
-	// 같은 자리에 겹쳐 서 있으면 방향을 알 수 없다 → 헤드 아님
+bool ULOACombatLibrary::GetFacingDotToAttacker(const FVector& TargetLocation, const FVector& TargetForward,
+	const FVector& AttackerLocation, float& OutDot)
+{
+	OutDot = 0.f;
+
+	// 바닥 기준: 맞은 쪽 → 때린 사람 방향과 맞은 쪽이 보는 방향 (높이 무시)
+	const FVector ToAttacker = (AttackerLocation - TargetLocation).GetSafeNormal2D();
+	const FVector Forward = TargetForward.GetSafeNormal2D();
+
+	// 같은 자리에 겹쳐 서 있으면 방향을 알 수 없다 → 앞도 뒤도 아님
 	if (ToAttacker.IsNearlyZero() || Forward.IsNearlyZero())
 	{
 		return false;
 	}
 
-	// 두 방향의 내적 = cos(사이 각). 반각 안이면 cos(반각) 이상
+	// 두 방향의 내적 = cos(사이 각). 1 = 정면, 0 = 옆, -1 = 등 뒤
+	OutDot = FVector::DotProduct(Forward, ToAttacker);
+	return true;
+}
+
+bool ULOACombatLibrary::IsHeadDot(float Dot, float HalfAngleDegrees)
+{
+	// 앞 반각 안이면 cos(반각) 이상
 	//   예) 반각 45 → 기준 0.707: 정면 0° → 1.0 (헤드) / 30° → 0.87 (헤드) / 90° 옆 → 0 (아님) / 뒤 180° → -1 (아님)
-	const float CosHalfAngle = FMath::Cos(FMath::DegreesToRadians(HalfAngleDegrees));
-	return FVector::DotProduct(Forward, ToAttacker) >= CosHalfAngle;
+	return Dot >= FMath::Cos(FMath::DegreesToRadians(HalfAngleDegrees));
+}
+
+bool ULOACombatLibrary::IsBackDot(float Dot, float HalfAngleDegrees)
+{
+	// 뒤 반각 안이면 -cos(반각) 이하 (뒤 = 앞 방향과 180°)
+	//   예) 반각 45 → 기준 -0.707: 등 뒤 180° → -1 (백) / 뒤에서 30° 옆(150°) → -0.87 (백) / 90° 옆 → 0 (아님)
+	return Dot <= -FMath::Cos(FMath::DegreesToRadians(HalfAngleDegrees));
+}
+
+bool ULOACombatLibrary::IsHeadAttack(const AActor* Target, const AActor* Attacker, float HalfAngleDegrees)
+{
+	// 지금 자리로 본다
+	float Dot = 0.f;
+	return Target && Attacker && Target != Attacker
+		&& GetFacingDotToAttacker(Target->GetActorLocation(), Target->GetActorForwardVector(), Attacker->GetActorLocation(), Dot)
+		&& IsHeadDot(Dot, HalfAngleDegrees);
+}
+
+bool ULOACombatLibrary::IsBackAttack(const AActor* Target, const AActor* Attacker, float HalfAngleDegrees)
+{
+	float Dot = 0.f;
+	return Target && Attacker && Target != Attacker
+		&& GetFacingDotToAttacker(Target->GetActorLocation(), Target->GetActorForwardVector(), Attacker->GetActorLocation(), Dot)
+		&& IsBackDot(Dot, HalfAngleDegrees);
+}
+
+ELOAAttackSide ULOACombatLibrary::GetAttackSide(const FVector& AttackerLocation, const FVector& TargetLocation, float TargetYaw)
+{
+	// 맞은 쪽이 보는 방향 기준 때린 사람이 어디 서 있나
+	float Dot = 0.f;
+	if (!GetFacingDotToAttacker(TargetLocation, FRotator(0.f, TargetYaw, 0.f).Vector(), AttackerLocation, Dot))
+	{
+		return ELOAAttackSide::None;	// 겹쳐 서 있음
+	}
+
+	// 각도 (모든 대상 공통. 헤드·백·카운터가 같은 범위)
+	const float HalfAngle = GetDefault<ULOACombatSettings>()->DirectionalAttackHalfAngle;
+	if (IsHeadDot(Dot, HalfAngle))
+	{
+		return ELOAAttackSide::Front;
+	}
+	if (IsBackDot(Dot, HalfAngle))
+	{
+		return ELOAAttackSide::Back;
+	}
+	return ELOAAttackSide::Side;
+}
+
+ELOADirectionalAttack ULOACombatLibrary::GetDirectionalAttack(const FGameplayTagContainer& AttackTags, ELOAAttackSide AttackSide)
+{
+	// 이 공격의 속성 (Skill.Attribute.BackAttack / HeadAttack)과 공격 방향이 맞아야 보너스
+	if (AttackSide == ELOAAttackSide::Back && AttackTags.HasTagExact(LOAGameplayTags::Skill_Attribute_BackAttack))
+	{
+		return ELOADirectionalAttack::Back;
+	}
+	if (AttackSide == ELOAAttackSide::Front && AttackTags.HasTagExact(LOAGameplayTags::Skill_Attribute_HeadAttack))
+	{
+		return ELOADirectionalAttack::Head;
+	}
+	return ELOADirectionalAttack::None;
+}
+
+ELOADirectionalAttack ULOACombatLibrary::GetDirectionalAttackOnWeakPoint(const FGameplayTagContainer& AttackTags)
+{
+	// 방향 검사만 통과시킨 GetDirectionalAttack (사용자 11-18: "방향을 검사하는 코드만 무조건 통과")
+	if (AttackTags.HasTagExact(LOAGameplayTags::Skill_Attribute_BackAttack))
+	{
+		return ELOADirectionalAttack::Back;
+	}
+	if (AttackTags.HasTagExact(LOAGameplayTags::Skill_Attribute_HeadAttack))
+	{
+		return ELOADirectionalAttack::Head;
+	}
+	return ELOADirectionalAttack::None;
+}
+
+bool ULOACombatLibrary::IsWeakPointExposed(const AActor* Target)
+{
+	const UAbilitySystemComponent* TargetASC = UAbilitySystemGlobals::GetAbilitySystemComponentFromActor(Target);
+	return TargetASC && TargetASC->HasMatchingGameplayTag(LOAGameplayTags::State_Debuff_WeakPoint);
+}
+
+FActiveGameplayEffectHandle ULOACombatLibrary::ApplyStateTags(UAbilitySystemComponent* ASC, const FGameplayTagContainer& StateTags, float Duration)
+{
+	if (!ASC || StateTags.IsEmpty())
+	{
+		return FActiveGameplayEffectHandle();
+	}
+
+	// 시간이 있으면 TimedTags (스스로 사라짐), 없으면 InfiniteTags (지울 때까지). ULOAGameplayAbility::ApplyStateTagsToSelf와 같은 규칙
+	const bool bTimed = Duration > 0.f;
+	const TSubclassOf<UGameplayEffect> EffectClass = bTimed
+		? TSubclassOf<UGameplayEffect>(ULOAGE_TimedTags::StaticClass())
+		: TSubclassOf<UGameplayEffect>(ULOAGE_InfiniteTags::StaticClass());
+
+	FGameplayEffectSpecHandle SpecHandle = ASC->MakeOutgoingSpec(EffectClass, 1.f, ASC->MakeEffectContext());
+	if (!SpecHandle.IsValid())
+	{
+		LOA_LOG(ASC->GetAvatarActor(), Error, TEXT("[StateTags] Failed to make state tag effect spec (%s)."), *StateTags.ToStringSimple());
+		return FActiveGameplayEffectHandle();
+	}
+
+	if (bTimed)
+	{
+		SpecHandle.Data->SetSetByCallerMagnitude(LOAGameplayTags::SetByCaller_Duration, Duration);
+	}
+	SpecHandle.Data->DynamicGrantedTags.AppendTags(StateTags);
+	return ASC->ApplyGameplayEffectSpecToSelf(*SpecHandle.Data);
+}
+
+ELOADirectionalAttack ULOACombatLibrary::GetDirectionalAttackFromContext(const FGameplayEffectContextHandle& EffectContext)
+{
+	const FLOAGameplayEffectContext* LOAContext = FLOAGameplayEffectContext::Get(EffectContext);
+	return LOAContext ? LOAContext->GetAttackJudgeRecord().DirectionalAttack : ELOADirectionalAttack::None;
+}
+
+FLOAAttackJudgeRecord ULOACombatLibrary::GetAttackJudgeRecordFromContext(const FGameplayEffectContextHandle& EffectContext)
+{
+	const FLOAGameplayEffectContext* LOAContext = FLOAGameplayEffectContext::Get(EffectContext);
+	return LOAContext ? LOAContext->GetAttackJudgeRecord() : FLOAAttackJudgeRecord();
+}
+
+FLOAAttackJudgeRecord ULOACombatLibrary::DecideAttackJudgeRecord(const FLOASkillModuleContext& Context, const FLOATargetHit& Target)
+{
+	FLOAAttackJudgeRecord Record;
+
+	// 자리·시각: 판정한 쪽이 정해 줬으면 그것 (공격자 판정: 보고한 내 자리 + 내 화면에서 본 시각으로 되감은 보스 자리·방향·시각)
+	if (Target.bHasDirectionBasis)
+	{
+		Record.AttackSide = GetAttackSide(Target.AttackerLocation, Target.TargetLocation, Target.TargetYaw);
+		Record.ServerTime = Target.AttackJudgeServerTime;
+	}
+	// 아니면 지금 자리·지금 시각. 때린 사람 = 시전자 (장판·투사체로 때려도)
+	else
+	{
+		const AActor* Attacker = Context.Caster;
+		const AActor* TargetActor = Target.Target;
+		if (Attacker && TargetActor && Attacker != TargetActor)
+		{
+			Record.AttackSide = GetAttackSide(Attacker->GetActorLocation(), TargetActor->GetActorLocation(), TargetActor->GetActorRotation().Yaw);
+		}
+		Record.ServerTime = LOANetTime::GetServerTimeNow(TargetActor ? TargetActor->GetWorld() : nullptr);
+	}
+
+	// 백 / 헤드 보너스 = 공격 방향 + 스킬 속성
+	//   약점 공격(대난투 중 보스, 2026-11-18 apply124)이면 방향 검사를 건너뛴다. 공격 방향(AttackSide)은 실제 자리 그대로 둔다 (카운터가 읽음)
+	//   예) 대난투 중 보스 옆에서 백 어택 스킬 → AttackSide = Side, DirectionalAttack = Back, bWeakPoint = true
+	//       → 데미지 +백 보너스, 치명타 +백 어택 몫 (아래 RollCritical), 숫자 옆 "약점 공격"
+	if (IsWeakPointExposed(Target.Target))
+	{
+		Record.DirectionalAttack = GetDirectionalAttackOnWeakPoint(Context.AttackTags);
+		Record.bWeakPoint = (Record.DirectionalAttack != ELOADirectionalAttack::None);
+	}
+	else
+	{
+		Record.DirectionalAttack = GetDirectionalAttack(Context.AttackTags, Record.AttackSide);
+	}
+
+	// 치명타 (2026-11-13). 백 어택이면 확률이 오르므로 백 / 헤드 다음에
+	Record.bCritical = RollCritical(Context, Target, Record.DirectionalAttack);
+	return Record;
+}
+
+bool ULOACombatLibrary::RollCritical(const FLOASkillModuleContext& Context, const FLOATargetHit& Target, ELOADirectionalAttack DirectionalAttack)
+{
+	// 플레이어 편이 적을 때릴 때만 (보스는 치명타 개념 없음 / 아군 회복·보호막·버프는 치명타 없음. 사용자 2026-11-13)
+	if (!IsPlayerSide(Context.Caster) || !IsEnemy(Context.Caster, Target.Target))
+	{
+		return false;
+	}
+
+	// 확률 = 기본 + 때린 쪽 추가분(Player 스탯) − 맞은 쪽 치명타 저항(Combat 스탯) + 백 어택 보너스
+	//   예) 0.7 + 0 − (약점 노출로 −0.1) + 백 어택 0.1 = 0.9
+	//   스탯창이 없으면 GetNumericAttribute가 0 → 그 몫은 없음 (예: 허수아비는 Combat이 없어 저항 0)
+	const ULOACombatSettings* Settings = GetDefault<ULOACombatSettings>();
+	float Chance = Settings->BaseCritRate;
+	if (Context.SourceASC)
+	{
+		Chance += Context.SourceASC->GetNumericAttribute(ULOAAttributeSet_Player::GetExtraCritRateAttribute());
+	}
+	if (const UAbilitySystemComponent* TargetASC = UAbilitySystemGlobals::GetAbilitySystemComponentFromActor(Target.Target))
+	{
+		Chance -= TargetASC->GetNumericAttribute(ULOAAttributeSet_Combat::GetCritResistanceAttribute());
+	}
+	if (DirectionalAttack == ELOADirectionalAttack::Back)
+	{
+		Chance += Settings->BackAttackCritRateBonus;
+	}
+	Chance = FMath::Clamp(Chance, 0.f, 1.f);
+
+	// [0, 1) 무작위가 확률보다 작으면 치명타. 확률 1이면 언제나, 0이면 절대 안 남
+	return FMath::FRand() < Chance;
 }
 
 bool ULOACombatLibrary::IsAlly(const AActor* A, const AActor* B)
@@ -717,6 +949,20 @@ void ULOACombatLibrary::ApplyPayload(
 	const FLOATargetHit& Target,
 	const FLOAEffectPayload& Payload)
 {
+	// 혼자 불렸으면 이 타격의 공격 판정 기록을 여기서 정한다 (ApplyPayloads는 대상마다 한 번 정해서 몸통을 바로 부른다)
+	if (!Context.SourceASC || !Context.SourceASC->IsOwnerActorAuthoritative())
+	{
+		return;
+	}
+	ApplyPayloadWithRecord(Context, Target, Payload, DecideAttackJudgeRecord(Context, Target));
+}
+
+void ULOACombatLibrary::ApplyPayloadWithRecord(
+	const FLOASkillModuleContext& Context,
+	const FLOATargetHit& Target,
+	const FLOAEffectPayload& Payload,
+	const FLOAAttackJudgeRecord& AttackJudgeRecord)
+{
 	// 효과는 서버만 준다. (보낸 쪽 ASC의 주인이 서버 권한을 가졌는지로 확인)
 	UAbilitySystemComponent* SourceASC = Context.SourceASC;
 	if (!SourceASC || !Target.Target || !Payload.Effect || !SourceASC->IsOwnerActorAuthoritative())
@@ -736,6 +982,12 @@ void ULOACombatLibrary::ApplyPayload(
 	//    Spec          = "이 GE를 이 레벨로, 이 EffectContext로" 적용할 준비물
 	FGameplayEffectContextHandle EffectContext = SourceASC->MakeEffectContext();
 
+	//    보낸 스킬도 적는다 (2026-11-07). 받는 쪽이 "어느 스킬이 건 효과인가"를 알 수 있게. 예) 같은 스킬 보호막 덮어쓰기
+	if (Context.SourceAbility)
+	{
+		EffectContext.SetAbility(Context.SourceAbility);
+	}
+
 	//    맞은 지점이 있으면 EffectContext에 기록 → 받는 쪽 AttributeSet이 꺼내서 데미지 숫자 위치로 쓴다.
 	//    bReset = true: 혹시 남아 있던 HitResult를 덮어쓴다.
 	if (Target.bHasHitPoint)
@@ -750,10 +1002,26 @@ void ULOACombatLibrary::ApplyPayload(
 		EffectContext.AddSourceObject(Context.SourceActor);
 	}
 
+	//    공격 판정 기록(공격 방향, 백 / 헤드, 시각, 치명타)을 우리 쪽지(FLOAGameplayEffectContext)에 적는다. 정하는 곳은 DecideAttackJudgeRecord 하나
+	//    → 데미지 계산(보너스·치명타 배율)과 데미지 숫자(글자·노란 숫자)는 이 칸을 읽기만 한다.
+	//    자리·시각 = Target의 "공격 판정 기록을 정할 자리·시각"(공격자 판정이 채움 = 내 화면에서 본 보스) / 없으면 지금 자리·지금 시각
+	//    (2026-11-13) 기록은 받아서 적는다. 치명타가 무작위라 GE마다 다시 정하면 데미지 GE끼리 결과가 갈린다
+	if (FLOAGameplayEffectContext* LOAContext = FLOAGameplayEffectContext::Get(EffectContext))
+	{
+		LOAContext->SetAttackJudgeRecord(AttackJudgeRecord);
+	}
+
 	FGameplayEffectSpecHandle SpecHandle = SourceASC->MakeOutgoingSpec(Payload.Effect, Context.Level, EffectContext);
 	if (!SpecHandle.IsValid())
 	{
 		return;
+	}
+
+	//    공격 속성(Skill.Attribute.*, 예: BackAttack)을 Spec 태그로도 붙인다 → GE 조건 칸(Source Tags 등)이 "백 어택 스킬인가"를 읽을 수 있다.
+	//    (엔진 코드 확인: AppendDynamicAssetTags는 Spec의 Asset 태그 + 때린 쪽 캡처 태그 둘 다에 넣는다. GameplayEffect.cpp)
+	if (!Context.AttackTags.IsEmpty())
+	{
+		SpecHandle.Data->AppendDynamicAssetTags(Context.AttackTags);
 	}
 
 	// ③ 차지 배율은 모든 GE에 항상 넣는다. (차지 스킬이 아니면 1)
@@ -777,33 +1045,90 @@ void ULOACombatLibrary::ApplyPayload(
 	SourceASC->ApplyGameplayEffectSpecToTarget(*SpecHandle.Data.Get(), TargetASC);
 }
 
+TSubclassOf<UGameplayEffect> ULOACombatLibrary::FindPayloadEffect(const TArray<FLOAEffectPayload>& Payloads, TSubclassOf<UGameplayEffect> EffectClass)
+{
+	if (!EffectClass)
+	{
+		return nullptr;
+	}
+	for (const FLOAEffectPayload& Payload : Payloads)
+	{
+		if (Payload.Effect && Payload.Effect->IsChildOf(EffectClass))
+		{
+			return Payload.Effect;
+		}
+	}
+	return nullptr;
+}
+
 void ULOACombatLibrary::ApplyPayloads(
 	const FLOASkillModuleContext& Context,
 	const TArray<FLOATargetHit>& Targets,
 	const TArray<FLOAEffectPayload>& Payloads)
 {
+	// 이 판정에 효과가 들어간 대상이 있었나 / 그중 적이 있었나 (아이덴티티 게이지 수급용, 2026-11-09)
+	bool bAppliedAny = false;
+	bool bHitEnemy = false;
+
 	// 대상마다, Payload마다 한 번씩. (대상 3명 × Payload 2개 = GE 적용 6번)
 	for (const FLOATargetHit& Target : Targets)
 	{
-		for (const FLOAEffectPayload& Payload : Payloads)
+		// 무적(State.Body.Invulnerable, 부활 직후 등)인 적에게는 아무것도 주지 않는다. 데미지·피격 이상·"맞았다" 신호 모두.
+		// 모든 공격(스킬·장판·투사체·피해자 판정)이 여기를 지나가므로 한 곳에서 막는다. 아군의 힐·버프는 그대로 준다.
+		if (IsInvulnerableTo(Context.Caster, Target.Target))
 		{
-			ApplyPayload(Context, Target, Payload);
+			continue;
 		}
 
+		// 이 대상에 대한 공격 판정 기록은 한 번만 정한다 (치명타가 무작위라. 그 대상의 모든 GE와 "맞았다" 신호가 같은 기록, 2026-11-13)
+		//   서버가 아니면 ApplyPayloadWithRecord·SendHitEvent가 아무것도 안 하므로 굴리지 않는다
+		const FLOAAttackJudgeRecord AttackJudgeRecord = (Context.SourceASC && Context.SourceASC->IsOwnerActorAuthoritative())
+			? DecideAttackJudgeRecord(Context, Target) : FLOAAttackJudgeRecord();
+
+		for (const FLOAEffectPayload& Payload : Payloads)
+		{
+			ApplyPayloadWithRecord(Context, Target, Payload, AttackJudgeRecord);
+		}
+
+		bAppliedAny = true;
+		bHitEnemy |= IsEnemy(Context.Caster, Target.Target);
+
 		// 효과를 다 준 뒤 "맞았다"를 알린다. (이 데미지로 죽었으면 사망이 패턴을 취소해서 카운터 모듈이 받지 않는다)
-		SendHitEvent(Context, Target.Target);
+		SendHitEvent(Context, Target, AttackJudgeRecord);
+	}
+
+	// 판정 1번 = 이 함수 1번. 보낸 스킬에게 알린다 (적 타격형 아이덴티티 수급: 맞은 적 수와 무관하게 1번)
+	if (bAppliedAny)
+	{
+		if (ULOAGameplayAbility* SourceAbility = Cast<ULOAGameplayAbility>(Context.SourceAbility))
+		{
+			SourceAbility->NotifyPayloadsApplied(bHitEnemy);
+		}
 	}
 }
 
-void ULOACombatLibrary::SendHitEvent(const FLOASkillModuleContext& Context, AActor* Target)
+bool ULOACombatLibrary::IsInvulnerableTo(const AActor* Attacker, const AActor* Target)
 {
+	if (!Target || !IsEnemy(Attacker, Target))
+	{
+		return false;
+	}
+
+	const UAbilitySystemComponent* TargetASC = UAbilitySystemGlobals::GetAbilitySystemComponentFromActor(Target);
+	return TargetASC && TargetASC->HasMatchingGameplayTag(LOAGameplayTags::State_Body_Invulnerable);
+}
+
+void ULOACombatLibrary::SendHitEvent(const FLOASkillModuleContext& Context, const FLOATargetHit& Target, const FLOAAttackJudgeRecord& AttackJudgeRecord)
+{
+	AActor* TargetActor = Target.Target;
+
 	// 서버만. 적을 쳤을 때만 (아군 힐·버프는 "맞음"이 아니다)
-	if (!Target || !Context.SourceASC || !Context.SourceASC->IsOwnerActorAuthoritative() || !IsEnemy(Context.Caster, Target))
+	if (!TargetActor || !Context.SourceASC || !Context.SourceASC->IsOwnerActorAuthoritative() || !IsEnemy(Context.Caster, TargetActor))
 	{
 		return;
 	}
 
-	UAbilitySystemComponent* TargetASC = UAbilitySystemGlobals::GetAbilitySystemComponentFromActor(Target);
+	UAbilitySystemComponent* TargetASC = UAbilitySystemGlobals::GetAbilitySystemComponentFromActor(TargetActor);
 	if (!TargetASC)
 	{
 		return;
@@ -813,8 +1138,18 @@ void ULOACombatLibrary::SendHitEvent(const FLOASkillModuleContext& Context, AAct
 	FGameplayEventData Payload;
 	Payload.EventTag = LOAGameplayTags::Event_Combat_Hit;
 	Payload.Instigator = Context.Caster;
-	Payload.Target = Target;
+	Payload.Target = TargetActor;
 	Payload.InstigatorTags = Context.AttackTags;
+
+	// 공격 판정 기록 (데미지 GE의 쪽지와 같은 기록, ApplyPayloads가 넘겨 줌). 신호의 쪽지 칸(ContextHandle)으로 보낸다 (2026-11-03)
+	//   예) 카운터: 공격 방향이 Front인가 + 그 시각에 파란 구간이었나
+	FGameplayEffectContextHandle EventContext = Context.SourceASC->MakeEffectContext();
+	if (FLOAGameplayEffectContext* LOAContext = FLOAGameplayEffectContext::Get(EventContext))
+	{
+		LOAContext->SetAttackJudgeRecord(AttackJudgeRecord);
+		Payload.ContextHandle = EventContext;
+	}
+
 	TargetASC->HandleGameplayEvent(LOAGameplayTags::Event_Combat_Hit, &Payload);
 }
 
@@ -867,51 +1202,19 @@ bool ULOACombatLibrary::MakeClosestHitResult(AActor* Target, FVector FromLocatio
 	return true;
 }
 
-// =============================================================================
-// 데미지 알림
-// =============================================================================
-
-void ULOACombatLibrary::NotifyDamageDealt(AActor* Instigator, AActor* Target, float Damage, const FHitResult* HitResult)
+bool ULOACombatLibrary::MakeShapeHitResult(AActor* Target, const FVector& ShapeCenter, FHitResult& OutHit)
 {
-	if (!Instigator || !Target || Damage <= 0.f || !Instigator->HasAuthority())
+	if (!Target)
 	{
-		return;
+		return false;
 	}
 
-	// 보낸 사람 → 그 플레이어의 PlayerController
-	//   플레이어 Ability가 만든 데미지: 보낸 사람 = PlayerState (ASC의 주인)
-	//   혹시 Pawn이나 Controller가 들어와도 찾을 수 있게 한다.
-	APlayerController* PC = nullptr;
-	if (const APlayerState* PS = Cast<APlayerState>(Instigator))
+	// 기준점을 대상 몸 중심 높이로 올려서 가장 가까운 점 → 같은 방향의 몸 가운데 높이
+	const FVector Reference(ShapeCenter.X, ShapeCenter.Y, Target->GetActorLocation().Z);
+	if (!MakeClosestHitResult(Target, Reference, OutHit))
 	{
-		PC = PS->GetPlayerController();
+		return false;
 	}
-	else if (const APawn* Pawn = Cast<APawn>(Instigator))
-	{
-		PC = Cast<APlayerController>(Pawn->GetController());
-	}
-	else
-	{
-		PC = Cast<APlayerController>(Instigator);
-	}
-
-	// 보스/몬스터가 때린 경우는 PlayerController가 없다 → 여기서 끝
-	// PC 클래스를 직접 알 필요 없이 전투 RPC 컴포넌트만 찾는다.
-	ULOACombatRPCComponent* CombatRPC = PC ? PC->FindComponentByClass<ULOACombatRPCComponent>() : nullptr;
-	if (CombatRPC)
-	{
-		FLOADamageNumberInfo Info;
-		Info.Damage = Damage;
-
-		// 맞은 지점 → 대상 기준 상대 위치 (클라의 대상 위치에 더해서 쓴다. 지연으로 위치가 어긋나도 대상에 붙어 보이게)
-		// 맞은 지점이 없으면(도트 등) 비워 둔다. → 받은 클라가 내 캐릭터 기준으로 계산
-		if (HitResult)
-		{
-			Info.bHasHitOffset = true;
-			Info.HitOffset = HitResult->ImpactPoint - Target->GetActorLocation();
-		}
-
-		// 그 플레이어 컴퓨터로만 간다. (리슨 서버 호스트 본인이면 바로 실행)
-		CombatRPC->ClientShowDamageNumber(Target, Info);
-	}
+	OutHit.TraceStart = ShapeCenter;
+	return true;
 }

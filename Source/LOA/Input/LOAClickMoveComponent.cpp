@@ -396,6 +396,7 @@ void ULOAClickMoveComponent::InsertBodyBlockDetours(const APawn* Pawn, const TAr
 
 	int32 Inserted = 0;
 	int32 Index = 0;
+	bool bAnyBothSidesBlocked = false;	// 디버그 선 색 (빨강 = 양쪽 다 막힘, C안이 필요한 경우)
 	while (Index + 1 < InOutPoints.Num() && Inserted < MaxDetoursPerPath)
 	{
 		const FVector A = InOutPoints[Index];
@@ -441,31 +442,61 @@ void ULOAClickMoveComponent::InsertBodyBlockDetours(const APawn* Pawn, const TAr
 			{
 				Side = Memory->Side;
 			}
+		}
+
+		// 한쪽으로 도는 지점들 만들기
+		auto MakeDetour = [&](int8 InSide)
+		{
+			const double Arc = InSide > 0 ? ArcPlus : ArcMinus;
+			const double StartAngle = InSide > 0 ? AngleA + TangentA : AngleA - TangentA;
+			const int32 Steps = FMath::Max(1, FMath::CeilToInt(Arc / FMath::DegreesToRadians(static_cast<double>(DetourMaxStepAngle))));
+			const double Step = Arc / Steps;
+
+			// 지점은 원보다 조금 바깥에 둔다 → 지점 사이 직선이 원에 딱 닿기만 하고 안으로 들어가지 않는다
+			//   예) 원 254, 간격 25도 → 254 ÷ cos(12.5도) ≈ 260cm
+			const double VertexRadius = Radius / FMath::Cos(Step * 0.5);
+
+			TArray<FVector> Points;
+			Points.Reserve(Steps + 1);
+			for (int32 StepIndex = 0; StepIndex <= Steps; ++StepIndex)
+			{
+				const double Angle = StartAngle + InSide * Step * StepIndex;
+				Points.Add(FVector(
+					Center.X + VertexRadius * FMath::Cos(Angle),
+					Center.Y + VertexRadius * FMath::Sin(Angle),
+					FMath::Lerp(A.Z, B.Z, static_cast<double>(StepIndex) / Steps)));
+			}
+			return Points;
+		};
+
+		// ---------- 고른 쪽이 벽·구조물에 막혔으면 반대쪽 (2026-11-12 apply105) ----------
+		// 원 계산은 보스만 알고 벽을 모른다 → 보스 옆에 상자가 있으면 그 틈으로 도는 길을 만들어 상자에 붙어 멈췄다.
+		// 내비메시로 검사해서 막혔으면 반대쪽. 양쪽 다 막혔으면 지금처럼 고른 쪽 그대로 (C안 = 구조물을 크게 돌아가기는 나중)
+		TArray<FVector> Detour = MakeDetour(Side);
+		if (!IsDetourWalkable(A, Detour, B))
+		{
+			TArray<FVector> OtherDetour = MakeDetour(static_cast<int8>(-Side));
+			if (IsDetourWalkable(A, OtherDetour, B))
+			{
+				Side = static_cast<int8>(-Side);
+				Detour = MoveTemp(OtherDetour);
+			}
+			else
+			{
+				bAnyBothSidesBlocked = true;
+				LOA_LOG(this, Verbose, TEXT("[ClickMove] Detour: both sides of %s are blocked by the level. Keeping side %d."),
+					*GetNameSafe(Blocker.IsValid() ? Blocker->GetOwner() : nullptr), Side);
+			}
+		}
+
+		// 이번에 실제로 돈 쪽을 기억 (막혀서 바꿨으면 바꾼 쪽)
+		if (Memory)
+		{
 			Memory->Side = Side;
 		}
 		else
 		{
 			DetourSides.Add({ Blocker, Side });
-		}
-
-		const double Arc = Side > 0 ? ArcPlus : ArcMinus;
-		const double StartAngle = Side > 0 ? AngleA + TangentA : AngleA - TangentA;
-		const int32 Steps = FMath::Max(1, FMath::CeilToInt(Arc / FMath::DegreesToRadians(static_cast<double>(DetourMaxStepAngle))));
-		const double Step = Arc / Steps;
-
-		// 지점은 원보다 조금 바깥에 둔다 → 지점 사이 직선이 원에 딱 닿기만 하고 안으로 들어가지 않는다
-		//   예) 원 254, 간격 25도 → 254 ÷ cos(12.5도) ≈ 260cm
-		const double VertexRadius = Radius / FMath::Cos(Step * 0.5);
-
-		TArray<FVector> Detour;
-		Detour.Reserve(Steps + 1);
-		for (int32 StepIndex = 0; StepIndex <= Steps; ++StepIndex)
-		{
-			const double Angle = StartAngle + Side * Step * StepIndex;
-			Detour.Add(FVector(
-				Center.X + VertexRadius * FMath::Cos(Angle),
-				Center.Y + VertexRadius * FMath::Sin(Angle),
-				FMath::Lerp(A.Z, B.Z, static_cast<double>(StepIndex) / Steps)));
 		}
 
 		InOutPoints.Insert(Detour, Index + 1);
@@ -478,13 +509,40 @@ void ULOAClickMoveComponent::InsertBodyBlockDetours(const APawn* Pawn, const TAr
 	{
 		if (const UWorld* World = GetWorld())
 		{
+			// 노랑 = 보통 / 빨강 = 어느 보스의 양쪽이 다 막혀서 막힌 쪽으로 감 (C안이 필요한 경우)
 			const FVector Up(0.f, 0.f, 20.f);
+			const FColor LineColor = bAnyBothSidesBlocked ? FColor::Red : FColor::Yellow;
 			for (int32 Line = 0; Line + 1 < InOutPoints.Num(); ++Line)
 			{
-				DrawDebugLine(World, InOutPoints[Line] + Up, InOutPoints[Line + 1] + Up, FColor::Yellow, false, FollowRepathInterval + 0.05f, 0, 3.f);
+				DrawDebugLine(World, InOutPoints[Line] + Up, InOutPoints[Line + 1] + Up, LineColor, false, FollowRepathInterval + 0.05f, 0, 3.f);
 			}
 		}
 	}
+}
+
+bool ULOAClickMoveComponent::IsDetourWalkable(const FVector& A, const TArray<FVector>& Detour, const FVector& B) const
+{
+	// 직선 A → 지점들 → B를 하나씩 내비메시 위에서 검사. 하나라도 내비메시가 끝나거나 막히면 false
+	//   내비메시는 캐릭터 반지름만큼 벽에서 깎여 있다 → 통과 = 캐릭터가 지나갈 수 있음
+	//   (FindReachableGoal과 같은 함수: 도중에 막히면 true를 돌려준다)
+	UWorld* World = GetWorld();
+	if (!World || Detour.IsEmpty())
+	{
+		return true;	// 검사할 수 없으면 지금까지처럼 그대로 쓴다
+	}
+
+	FVector HitLocation;
+	FVector From = A;
+	for (int32 PointIndex = 0; PointIndex <= Detour.Num(); ++PointIndex)
+	{
+		const FVector& To = Detour.IsValidIndex(PointIndex) ? Detour[PointIndex] : B;
+		if (UNavigationSystemV1::NavigationRaycast(World, From, To, HitLocation, nullptr, GetOwningPlayerController()))
+		{
+			return false;
+		}
+		From = To;
+	}
+	return true;
 }
 
 const ULOAClickMoveComponent::FBodyBlockCircle* ULOAClickMoveComponent::FindFirstCircleOnSegment(const TArray<FBodyBlockCircle>& Circles, const FVector& A, const FVector& B) const
@@ -653,7 +711,11 @@ bool ULOAClickMoveComponent::IsMoveBlocked() const
 	const UAbilitySystemComponent* ASC = PC ? UAbilitySystemGlobals::GetAbilitySystemComponentFromActor(PC->PlayerState) : nullptr;
 
 	// HasMatchingGameplayTag: 자식 태그도 맞다고 본다. (예: State.Block.Move.Stun이 붙어 있어도 true)
-	return ASC && ASC->HasMatchingGameplayTag(LOAGameplayTags::State_Block_Move);
+	// 죽어 있어도 막는다. (가던 길도 Tick에서 멈춤 → 부활했을 때 예전 목적지로 걸어가지 않는다)
+	// 상태 이상(스턴 등) 중에도 막는다 (2026-11-10). 스턴 GA가 띄움·사망에 끊겨도 스턴 GE가 남아 있는 동안은 못 걷는다
+	return ASC && (ASC->HasMatchingGameplayTag(LOAGameplayTags::State_Block_Move)
+		|| ASC->HasMatchingGameplayTag(LOAGameplayTags::State_CrowdControl_Status)
+		|| ASC->HasMatchingGameplayTag(LOAGameplayTags::State_Body_Dead));
 }
 
 APawn* ULOAClickMoveComponent::GetControlledPawn() const

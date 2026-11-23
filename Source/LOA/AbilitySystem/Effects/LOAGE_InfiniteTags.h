@@ -4,7 +4,7 @@
 //   규칙(이 클래스) : Infinite / Modifier 없음
 //   값(쓰는 쪽)     : 태그 → Spec의 DynamicGrantedTags에 추가 (붙어 있는 동안 ASC가 이 태그를 가짐)
 //
-// 쓰는 곳: ULOAGA_Death (State.Dead)
+// 쓰는 곳: ULOAGA_Death (State.Body.Dead)
 //   나중에: "풀릴 때까지" 유지되는 상태 (예: 기믹 중 무적, 그로기처럼 끝이 시간이 아닌 것)
 //
 // [ULOAGE_TimedTags와의 차이 = 수명]

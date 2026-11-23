@@ -18,6 +18,7 @@
 //      (다) 보스 몸을 클릭했으면 → 클릭한 곳에서 가장 가까운 몸 바깥 (PushOutOfBodyBlockers, 2026-10-20)
 //   ③ 내 컴퓨터에서 직접 길찾기 → 경로 지점 목록 (내비메시는 보스를 모른다 → 보스를 관통하는 직선이 나올 수 있음)
 //   ③' 보스 돌아가기 (InsertBodyBlockDetours, 2026-10-20 B안): 경로의 각 직선이 몸 막이를 지나가면 몸을 감싸는 원을 따라 도는 지점을 끼워 넣는다
+//      (2026-11-12) 도는 쪽이 벽·구조물에 막혔으면 반대쪽으로 (내비메시 직선 검사). 양쪽 다 막히면 아직 못 돎 (다음_할_일 C안)
 //      따라가는 동안에도 Follow Repath Interval(0.25초)마다 ②~③'을 다시 한다 → 보스가 움직이면 돌아가는 길도 바뀜
 //   ④ 매 프레임: 다음 지점 방향으로 Pawn->AddMovementInput()
 //      지점에 가까워지면 다음 지점으로, 마지막 지점이면 정지
@@ -43,7 +44,7 @@
 // [이동 금지 - State.Block.Move 태그]
 // 내 ASC에 State.Block.Move 태그가 붙어 있는 동안은 클릭 이동을 하지 않는다.
 //   - 스킬 시전 중 : ULOAPlayerAbility가 bBlockMove(기본 켜짐)일 때 발동~종료 동안 태그를 붙임
-//   - 기절 등     : 상태 이상 GE가 State.Block.Move를 붙임 (예정)
+//   - 기절 등     : 상태 이상 태그 State.CrowdControl.Status.* 자체로 막는다 (2026-11-10. 스턴 GA가 끊겨도 스턴 GE가 남아 있는 동안)
 //
 // 확인하는 곳 두 군데:
 //   ① 경로를 새로 만들 때 (MoveToCursor) → 막혀 있으면 우클릭 입력 무시
@@ -171,8 +172,15 @@ private:
 	 *   예) 보스 200 + 나 34 + 여유 20 = 254cm. 나는 보스 서쪽 600cm, 목표는 동쪽 600cm
 	 *     → 나에서 원에 닿는 점(접점)으로 → 원을 따라 30도 이하 간격으로 → 목표 쪽 접점 → 목표
 	 *   왼쪽·오른쪽 중 짧은 쪽으로 돈다. 거의 같으면 지난번에 고른 쪽을 유지한다 (보스가 조금 움직일 때마다 좌우로 흔들리지 않게)
+	 *   (2026-11-12) 고른 쪽이 벽·구조물에 막혔으면(IsDetourWalkable) 반대쪽. 양쪽 다 막혔으면 고른 쪽 그대로
+	 *     예) 보스 오른쪽에 상자가 붙어 있음 → 오른쪽이 짧아도 왼쪽으로 돈다
+	 *     한계: 원 계산만 바꾼 것이라 길찾기는 여전히 보스를 모른다. 보스가 통로를 막아 양쪽 다 막히면
+	 *           구조물 바깥으로 크게 돌아가는 길은 못 찾는다 (C안, 다음_할_일). 그때 디버그 선이 빨강
 	 */
 	void InsertBodyBlockDetours(const APawn* Pawn, const TArray<FBodyBlockCircle>& Circles, TArray<FVector>& InOutPoints);
+
+	/** 직선 A → 돌아가는 지점들 → B가 전부 내비메시 위로 이어지나 (중간에 벽·구조물·맵 끝이 없나) */
+	bool IsDetourWalkable(const FVector& A, const TArray<FVector>& Detour, const FVector& B) const;
 
 	/** 직선 A→B가 지나가는 원 중 A에서 가장 먼저 만나는 것. 없으면 nullptr */
 	const FBodyBlockCircle* FindFirstCircleOnSegment(const TArray<FBodyBlockCircle>& Circles, const FVector& A, const FVector& B) const;
@@ -186,7 +194,7 @@ private:
 	 */
 	bool FindReachableGoal(UNavigationSystemV1* NavSys, const APawn* Pawn, const FVector& ClickLocation, FVector& OutGoal) const;
 
-	/** 내 ASC에 State.Block.Move 태그가 붙어 있으면 true (스킬 시전 중, 기절 등) */
+	/** 내 ASC에 State.Block.Move, State.CrowdControl.Status(기절 등), State.Body.Dead 중 하나라도 있으면 true */
 	bool IsMoveBlocked() const;
 
 	/** 조종 중인 Pawn. 저장하지 않고 매번 가져온다. (사망 후 새 캐릭터로 바뀌어도 대응) */
@@ -256,7 +264,7 @@ private:
 	UPROPERTY(EditDefaultsOnly, Category = "LOA|ClickMove|Detour", meta = (ClampMin = "1"))
 	int32 MaxDetoursPerPath = 4;
 
-	/** 켜면 돌아가는 길을 화면에 그린다 (노란 선, 다시 길찾기 간격만큼 남음). 테스트용 */
+	/** 켜면 돌아가는 길을 화면에 그린다 (노란 선, 다시 길찾기 간격만큼 남음. 보스 양쪽이 다 막혔으면 빨간 선). 테스트용 */
 	UPROPERTY(EditAnywhere, Category = "LOA|ClickMove|Detour")
 	bool bDrawDetourDebug = false;
 

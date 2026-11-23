@@ -7,8 +7,8 @@
 //                   회피 (ULOAGA_Dodge)                    기상기 (이 클래스)
 //   발동 조건       피격 이상 중이면 안 됨                  누워 있을 때만 (State.CrowdControl.Push.Down)
 //   면역            피격 이상·상태 이상 면역                없음 (사용자: 무적 없음)
-//   끊는 것         BP의 Cancel Abilities with Tag          띄움 GA (Ability.CrowdControl.Airborne) → 띄움·누움 GE가 지워짐
-//   쿨타임          Cooldown.Dodge                          따로 (예: Cooldown.WakeUp)
+//   끊는 것         BP의 Cancel Abilities with Tag          띄움 GA (Ability.Common.Airborne) → 띄움·누움 GE가 지워짐
+//   쿨타임          Cooldown.Common.Dodge                          따로 (예: Cooldown.Common.WakeUp)
 //
 // [키] GA는 자기 키를 모른다 (6장). 꾸러미가 InputTag.WakeUp으로 묶고, IMC에서 스페이스를 IA_Dodge와 IA_WakeUp 둘 다에 연결한다.
 //   서 있을 때 스페이스 → 회피만 발동 (기상기는 Down이 없어서 거절)
@@ -28,8 +28,8 @@
 //
 // [BP에서 설정할 것] GA_WakeUp (부모: LOAGA_WakeUp)
 //   Montage                   = 기상 구르기 몽타주 (끝 부분에 Event.Montage.Unlock, 회피와 같은 규칙)
-//   Cooldown Duration / Tags  = 10 / Cooldown.WakeUp
-//   Asset Tags                = Ability.WakeUp
+//   Cooldown Duration / Tags  = 10 / Cooldown.Common.WakeUp
+//   Asset Tags                = Ability.Common.WakeUp
 //   Dodge Distance / Duration = 300 / 0.3 (기본값)
 //   꾸러미: 플레이어 꾸러미에 InputTag.WakeUp으로. 아이콘(SkillDisplayInfo)은 비워 두면 스킬 슬롯에 안 나온다
 

@@ -30,7 +30,7 @@
 //   None     : 대상을 안 쓴다. 넘겨줘도 무시.                   예) 포효, 무력화 체크 시작, 맵 전체 전멸기
 //   Optional : 있으면 그쪽으로 돌고, 없으면 지금 방향 그대로.     예) 내려찍기 (기본값)
 //   Required : 대상이 없으면 발동하지 않는다.                    예) 돌진 (노릴 사람이 없으면 의미 없음)
-//   죽은 플레이어(State.Dead)는 "대상 없음"으로 본다. (ULOACombatLibrary::IsTargetable)
+//   죽은 플레이어(State.Body.Dead)는 "대상 없음"으로 본다. (ULOACombatLibrary::IsTargetable)
 //   "장소"를 노리는 패턴(맵 중앙으로 점프 등)은 대상을 쓰지 않고 패턴이 장소를 데이터로 가진다. (생길 때 만든다)
 //
 // ─────────────────────────────────────────────────────────────────────────────
@@ -59,7 +59,7 @@
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // [카운터]  이 클래스는 카운터를 모른다. 카운터 패턴은 Modules에 Counter 모듈(ULOASkillModule_Counter)을 넣는다.
-//   구간(언제 파랗나) = 몽타주 LOA Grant Tags(State.Counterable) / 판정·스턴 시간 = Counter 모듈 (2026-10-18)
+//   구간(언제 파랗나) = 몽타주 LOA Grant Tags(State.Window.Counterable) / 판정·스턴 시간 = Counter 모듈 (2026-10-18)
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // [네트워크]
@@ -72,7 +72,7 @@
 //   Tags                : Asset Tags = Ability.<보스>.<패턴>   ← TryActivatePattern이 이 태그로 찾는다 (필수)
 //   LOA|Ability|Montage : Montage, Montage Play Rate
 //   LOA|Ability|Cooldown: Cooldown Duration, Cooldown Tags (Cooldown.<보스>.<패턴>)
-//   LOA|Ability|Modules : Apply / Spawn / Move 모듈. 카운터 패턴은 Counter 모듈 추가 (몽타주에 State.Counterable 구간도 칠한다)
+//   LOA|Ability|Modules : Apply / Spawn / Move 모듈. 카운터 패턴은 Counter 모듈 추가 (몽타주에 State.Window.Counterable 구간도 칠한다)
 //   LOA|Monster         : Target Usage, Face Target, Stop Movement On Start
 //   꾸러미 등록          : DA_AbilityDataSet_Boss_<이름>의 Abilities에 추가 (InputTag 비움)
 

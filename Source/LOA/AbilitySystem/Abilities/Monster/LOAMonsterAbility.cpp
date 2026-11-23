@@ -101,7 +101,7 @@ bool ULOAMonsterAbility::CanActivatePattern(const UAbilitySystemComponent* ASC, 
 		return false;
 	}
 
-	// 쿨타임, 막는 태그(State.Block.Ability = 다른 패턴 중, State.Dead = 죽음)를 GAS가 발동 전에 보는 것과 같은 함수로 본다.
+	// 쿨타임, 막는 태그(State.Block.Ability = 다른 패턴 중, State.Body.Dead = 죽음)를 GAS가 발동 전에 보는 것과 같은 함수로 본다.
 	return Pattern->CanActivateAbility(Spec->Handle, ASC->AbilityActorInfo.Get());
 }
 

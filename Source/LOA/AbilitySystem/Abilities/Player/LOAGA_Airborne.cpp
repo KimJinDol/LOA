@@ -1,6 +1,7 @@
 // LOAGA_Airborne.cpp
 
 #include "AbilitySystem/Abilities/Player/LOAGA_Airborne.h"
+#include "Combat/LOACrowdControlPredictionComponent.h"
 #include "AbilitySystem/Effects/LOAGE_Airborne.h"
 #include "Character/Player/LOACharacterMovementComponent.h"
 #include "Core/LOAGameplayTags.h"
@@ -10,6 +11,7 @@
 #include "Abilities/Tasks/AbilityTask_PlayMontageAndWait.h"
 #include "Abilities/Tasks/AbilityTask_WaitDelay.h"
 #include "Animation/AnimMontage.h"
+#include "Animation/AnimInstance.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
 
@@ -18,8 +20,8 @@
 ULOAGA_Airborne::ULOAGA_Airborne(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
-	// 서버만 실행한다. (헤더 [왜 서버만 발사하나]) B 컴퓨터는 태그·몽타주·위치 보정으로 결과를 받는다.
-	NetExecutionPolicy = EGameplayAbilityNetExecutionPolicy::ServerOnly;
+	// 서버가 발동하고, 맞은 사람 컴퓨터에서도 같이 돈다 (그쪽은 몽타주만). 헤더 [네트워크]
+	NetExecutionPolicy = EGameplayAbilityNetExecutionPolicy::ServerInitiated;
 	NetSecurityPolicy = EGameplayAbilityNetSecurityPolicy::ServerOnly;
 
 	// 발동 조건: 띄움 태그가 붙는 순간 (0 → 1). 공중에서 또 맞아 개수만 늘 때는 발동하지 않는다 → 그건 OnEffectAppliedToSelf가
@@ -28,10 +30,13 @@ ULOAGA_Airborne::ULOAGA_Airborne(const FObjectInitializer& ObjectInitializer)
 	AirborneTrigger.TriggerSource = EGameplayAbilityTriggerSource::OwnedTagAdded;
 	AbilityTriggers.Add(AirborneTrigger);
 
-	// 기상기가 이 태그로 이 Ability를 끊는다 (ULOAGA_WakeUp의 Cancel Abilities with Tag)
-	SetAssetTags(FGameplayTagContainer(LOAGameplayTags::Ability_CrowdControl_Airborne));
+	// 취소하지 않을 성질 (2026-11-09): 아이덴티티처럼 CC를 맞아도 켜져 있어야 하는 Ability
+	AbilityTagsToKeep.AddTag(LOAGameplayTags::Ability_Trait_KeepOnCC);
 
-	// 죽어 있으면 발동 불가 (부모 생성자의 State.Dead 그대로)
+	// 기상기가 이 태그로 이 Ability를 끊는다 (ULOAGA_WakeUp의 Cancel Abilities with Tag)
+	SetAssetTags(FGameplayTagContainer(LOAGameplayTags::Ability_Common_Airborne));
+
+	// 죽어 있으면 발동 불가 (부모 생성자의 State.Body.Dead 그대로)
 }
 
 // =============================================================================
@@ -57,28 +62,65 @@ void ULOAGA_Airborne::ActivateAbility(
 	Phase = EPhase::InAir;
 	bHasLaunchGround = false;	// 이번 띄움의 "처음 뜬 땅"은 첫 발사 때 정한다
 
-	// ① 하던 일 멈추기 + 이동 금지 (GE라 B 컴퓨터에도 복제 → 클릭 이동이 멈춘다)
+	// ① 하던 일 멈추기 [둘 다] (B 컴퓨터도 끊어야 내 화면에서 바로 끊긴다. 서버도 끊고 결과를 복제한다)
 	CancelOtherAbilities(AbilityTagsToKeep);
-	BlockMoveEffectHandle = ApplyStateTagsToSelf(FGameplayTagContainer(LOAGameplayTags::State_Block_Move));
 
-	// 알림 구독: 또 맞음 / 띄움 태그가 다 빠짐(안전 시간) / 착지
-	EffectAppliedHandle = ASC->OnGameplayEffectAppliedDelegateToSelf.AddUObject(this, &ThisClass::OnEffectAppliedToSelf);
-	AirborneTagHandle = ASC->RegisterGameplayTagEvent(
-		LOAGameplayTags::State_CrowdControl_Push_Airborne, EGameplayTagEventType::AnyCountChange)
-		.AddUObject(this, &ThisClass::OnAirborneTagChanged);
+	if (IsServerSide())
+	{
+		// [서버만] 이동 금지 (GE라 B 컴퓨터에도 복제 → 클릭 이동이 멈춘다)
+		BlockMoveEffectHandle = ApplyStateTagsToSelf(FGameplayTagContainer(LOAGameplayTags::State_Block_Move));
+
+		// [서버만] 알림 구독: 또 맞음 / 띄움 태그가 다 빠짐(안전 시간)
+		EffectAppliedHandle = ASC->OnGameplayEffectAppliedDelegateToSelf.AddUObject(this, &ThisClass::OnEffectAppliedToSelf);
+		AirborneTagHandle = ASC->RegisterGameplayTagEvent(
+			LOAGameplayTags::State_CrowdControl_Push_Airborne, EGameplayTagEventType::AnyCountChange)
+			.AddUObject(this, &ThisClass::OnAirborneTagChanged);
+	}
+	else
+	{
+		// [B 컴퓨터만] 서버의 단계를 태그로 따라간다: 누움(착지 알림을 놓쳤을 때 대비) / 일어남
+		DownTagHandleOnOwner = ASC->RegisterGameplayTagEvent(
+			LOAGameplayTags::State_CrowdControl_Push_Down, EGameplayTagEventType::NewOrRemoved)
+			.AddUObject(this, &ThisClass::OnDownTagChangedOnOwner);
+		GettingUpTagHandleOnOwner = ASC->RegisterGameplayTagEvent(
+			LOAGameplayTags::State_CrowdControl_Push_GettingUp, EGameplayTagEventType::NewOrRemoved)
+			.AddUObject(this, &ThisClass::OnGettingUpTagChangedOnOwner);
+	}
+
+	// [둘 다] 착지 알림. 서버: 누움 시작 / B 컴퓨터: 내 화면에서 땅에 닿는 순간 Down 구간
 	Character->LandedDelegate.AddUniqueDynamic(this, &ThisClass::OnLanded);
 
-	// 몽타주: 공중 섹션부터. 일어나는 섹션이 끝나면(BlendOut/Completed) 종료. Ability가 끝나면 몽타주도 멈춘다
-	if (Montage)
+	// [B 컴퓨터] 피해자 판정에서 내가 먼저 띄움을 예측했으면 이어받는다 (예측 몽타주가 재생 중이면 그 위치부터)
+	//   ULOACrowdControlPredictionComponent
+	UAnimMontage* MontageToPlay = GetMontage();
+	float ResumeTime = -1.f;
+	if (!IsServerSide())
 	{
+		if (ULOACrowdControlPredictionComponent* PredictionComp = GetAvatarActorFromActorInfo()->FindComponentByClass<ULOACrowdControlPredictionComponent>())
+		{
+			ResumeTime = PredictionComp->ConfirmPrediction(MontageToPlay);
+		}
+	}
+
+	// 몽타주: 공중 섹션부터 (예측을 이어받으면 그 위치부터). 일어나는 섹션이 끝나면(BlendOut/Completed) 종료. Ability가 끝나면 몽타주도 멈춘다
+	if (MontageToPlay)
+	{
+		const bool bResume = ResumeTime >= 0.f;
 		UAbilityTask_PlayMontageAndWait* MontageTask = UAbilityTask_PlayMontageAndWait::CreatePlayMontageAndWaitProxy(
-			this, NAME_None, Montage, MontagePlayRate, AirSection, /*bStopWhenAbilityEnds*/ true);
+			this, NAME_None, MontageToPlay, MontagePlayRate, bResume ? NAME_None : AirSection, /*bStopWhenAbilityEnds*/ true,
+			/*AnimRootMotionTranslationScale*/ 1.f, /*StartTimeSeconds*/ bResume ? ResumeTime : 0.f);
 		MontageTask->OnBlendOut.AddDynamic(this, &ThisClass::OnAirborneMontageEnded);
 		MontageTask->OnCompleted.AddDynamic(this, &ThisClass::OnAirborneMontageEnded);
 		MontageTask->ReadyForActivation();
 	}
 
-	// ② 처음 발사: 방금 붙은 띄움 GE (태그가 붙는 순간 발동했으므로 이미 목록에 있다)
+	// ② 처음 발사 [서버만]: 방금 붙은 띄움 GE (태그가 붙는 순간 발동했으므로 이미 목록에 있다)
+	//    B 컴퓨터는 서버가 정한 궤적 숫자를 이동 컴포넌트 복제로 받는다.
+	if (!IsServerSide())
+	{
+		return;
+	}
+
 	if (const FActiveGameplayEffect* Newest = FindNewestAirborneEffect())
 	{
 		LastLaunchEffectHandle = Newest->Handle;
@@ -112,28 +154,52 @@ void ULOAGA_Airborne::EndAbility(
 		EffectAppliedHandle.Reset();
 		AirborneTagHandle.Reset();
 
+		// [B 컴퓨터] 예측으로 붙인 이동 금지를 푼다 (진짜 이동 금지 GE도 이 GA와 같이 끝난다)
+		const AActor* Avatar = ActorInfo ? ActorInfo->AvatarActor.Get() : nullptr;
+		if (ULOACrowdControlPredictionComponent* PredictionComp = Avatar ? Avatar->FindComponentByClass<ULOACrowdControlPredictionComponent>() : nullptr;
+			PredictionComp && !IsServerSide())
+		{
+			PredictionComp->EndPrediction();
+		}
+
+		// [B 컴퓨터] 태그 따라가기 알림 해제
+		if (ASC)
+		{
+			ASC->RegisterGameplayTagEvent(LOAGameplayTags::State_CrowdControl_Push_Down, EGameplayTagEventType::NewOrRemoved)
+				.Remove(DownTagHandleOnOwner);
+			ASC->RegisterGameplayTagEvent(LOAGameplayTags::State_CrowdControl_Push_GettingUp, EGameplayTagEventType::NewOrRemoved)
+				.Remove(GettingUpTagHandleOnOwner);
+		}
+		DownTagHandleOnOwner.Reset();
+		GettingUpTagHandleOnOwner.Reset();
+
 		if (ACharacter* Character = Cast<ACharacter>(ActorInfo ? ActorInfo->AvatarActor.Get() : nullptr))
 		{
 			Character->LandedDelegate.RemoveDynamic(this, &ThisClass::OnLanded);
 		}
 
-		RemoveOwnedEffect(DownEffectHandle);
-		RemoveOwnedEffect(BlockMoveEffectHandle);
-
-		// 아직 날아가는 중에 끊겼으면(사망 등) 궤적도 지운다. 이미 착지했으면 아무 일 없다
-		if (ACharacter* Character = Cast<ACharacter>(ActorInfo ? ActorInfo->AvatarActor.Get() : nullptr))
+		// 여기부터 [서버만]: 붙인 GE 지우기, 궤적 끝내기. (B 컴퓨터는 결과를 복제로 받는다)
+		if (IsServerSide())
 		{
-			if (ULOACharacterMovementComponent* Movement = Cast<ULOACharacterMovementComponent>(Character->GetCharacterMovement()))
+			RemoveOwnedEffect(GettingUpEffectHandle);
+			RemoveOwnedEffect(DownEffectHandle);
+			RemoveOwnedEffect(BlockMoveEffectHandle);
+
+			// 아직 날아가는 중에 끊겼으면(사망 등) 궤적도 지운다. 이미 착지했으면 아무 일 없다
+			if (ACharacter* Character = Cast<ACharacter>(ActorInfo ? ActorInfo->AvatarActor.Get() : nullptr))
 			{
-				Movement->StopCrowdControlMove();
+				if (ULOACharacterMovementComponent* Movement = Cast<ULOACharacterMovementComponent>(Character->GetCharacterMovement()))
+				{
+					Movement->StopCrowdControlMove();
+				}
 			}
-		}
 
-		// 띄움 GE를 모두 지운다 (정상 종료든, 기상기·사망으로 끊겼든). 띄움 GE의 시간은 안전용이라 끝내는 쪽은 언제나 이 Ability다
-		//   → 띄움 태그가 빠져 미끄러짐·때린 쪽 바라보기도 풀린다
-		if (ASC)
-		{
-			ASC->RemoveActiveEffectsWithGrantedTags(FGameplayTagContainer(LOAGameplayTags::State_CrowdControl_Push_Airborne));
+			// 띄움 GE를 모두 지운다 (정상 종료든, 기상기·사망으로 끊겼든). 띄움 GE의 시간은 안전용이라 끝내는 쪽은 언제나 이 Ability다
+			//   → 띄움 태그가 빠져 미끄러짐·때린 쪽 바라보기도 풀린다
+			if (ASC)
+			{
+				ASC->RemoveActiveEffectsWithGrantedTags(FGameplayTagContainer(LOAGameplayTags::State_CrowdControl_Push_Airborne));
+			}
 		}
 
 		LastLaunchEffectHandle.Invalidate();
@@ -274,9 +340,10 @@ void ULOAGA_Airborne::OnLanded(const FHitResult& Hit)
 void ULOAGA_Airborne::OnAirborneMontageEnded()
 {
 	// 일어나는 섹션이 끝났을 때만 종료. 공중·누움 섹션이 반복 연결이 안 돼 있어서 끝났으면 경고만 (시간·착지가 흐름을 정한다)
+	// B 컴퓨터: 자기 GA만 끝낸다 (서버에 알리지 않음. 알려도 서버는 받지 않는다 — NetSecurityPolicy ServerOnly)
 	if (Phase == EPhase::GettingUp)
 	{
-		EndAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo, true, false);
+		EndAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo, /*bReplicateEndAbility*/ IsServerSide(), false);
 		return;
 	}
 
@@ -293,9 +360,17 @@ void ULOAGA_Airborne::EnterDown()
 {
 	Phase = EPhase::Down;
 
+	// [둘 다] 누움 구간. 서버 → 남의 화면, B 컴퓨터 → 내 화면
+	JumpToSectionIfAny(DownSection);
+
+	// 여기부터 [서버만]: 누움 태그와 누운 시간 재기. B 컴퓨터는 누운 시간을 모른다(SetByCaller) → 일어남 태그를 기다린다
+	if (!IsServerSide())
+	{
+		return;
+	}
+
 	// 누움 태그 (복제): 다시 안 뜸 + 기상기 발동 조건 + 회피 막힘. 완전히 일어날 때까지 유지. 지우는 쪽 = EndAbility
 	DownEffectHandle = ApplyStateTagsToSelf(FGameplayTagContainer(LOAGameplayTags::State_CrowdControl_Push_Down));
-	JumpToSectionIfAny(DownSection);
 
 	LOA_LOG(GetAvatarActorFromActorInfo(), Log, TEXT("[Airborne] Landed → down for %.2fs"), PendingDownDuration);
 
@@ -320,8 +395,12 @@ void ULOAGA_Airborne::StartGetUp()
 
 	LOA_LOG(GetAvatarActorFromActorInfo(), Log, TEXT("[Airborne] Getting up"));
 
+	// 일어남 태그 (복제) → B 컴퓨터의 이 GA가 보고 GetUp 구간으로 넘어간다. 지우는 쪽 = EndAbility
+	GettingUpEffectHandle = ApplyStateTagsToSelf(FGameplayTagContainer(LOAGameplayTags::State_CrowdControl_Push_GettingUp));
+
 	// 일어나는 섹션이 없으면 바로 끝
-	if (!Montage || !Montage->IsValidSectionName(GetUpSection))
+	const UAnimMontage* MontageToPlay = GetMontage();
+	if (!MontageToPlay || !MontageToPlay->IsValidSectionName(GetUpSection))
 	{
 		EndAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo, true, false);
 		return;
@@ -334,12 +413,55 @@ void ULOAGA_Airborne::StartGetUp()
 // 도우미
 // =============================================================================
 
+// =============================================================================
+// B 컴퓨터: 서버의 단계를 태그로 따라가기
+// =============================================================================
+
+void ULOAGA_Airborne::OnDownTagChangedOnOwner(const FGameplayTag Tag, int32 NewCount)
+{
+	// 보통은 내 착지 알림(OnLanded)이 먼저 와서 이미 Down이다. 놓쳤을 때만 여기서 넘어간다
+	if (NewCount > 0 && Phase == EPhase::InAir)
+	{
+		EnterDown();
+	}
+}
+
+void ULOAGA_Airborne::OnGettingUpTagChangedOnOwner(const FGameplayTag Tag, int32 NewCount)
+{
+	if (NewCount > 0 && Phase != EPhase::GettingUp)
+	{
+		Phase = EPhase::GettingUp;
+		JumpToSectionIfAny(GetUpSection);
+	}
+}
+
+bool ULOAGA_Airborne::IsServerSide() const
+{
+	const FGameplayAbilityActorInfo* Info = GetCurrentActorInfo();
+	return Info && Info->IsNetAuthority();
+}
+
 void ULOAGA_Airborne::JumpToSectionIfAny(FName Section)
 {
-	// 서버가 점프하면 몽타주 복제로 모두에게 간다
-	if (Montage && Montage->IsValidSectionName(Section))
+	UAnimMontage* MontageToPlay = GetMontage();
+	if (!MontageToPlay || !MontageToPlay->IsValidSectionName(Section))
+	{
+		return;
+	}
+
+	// 서버: GAS 함수로 점프 → 남의 화면으로 복제된다
+	if (IsServerSide())
 	{
 		MontageJumpToSection(Section);
+		return;
+	}
+
+	// B 컴퓨터: 내 화면만 점프한다. GAS 함수(MontageJumpToSection)는 클라에서 부르면 서버 몽타주도 점프시키는 RPC를 보낸다
+	//   (UAbilitySystemComponent::CurrentMontageJumpToSection). 그러면 내가 먼저 착지했을 때 서버 몽타주가 미리 Down으로 넘어간다 → 쓰지 않는다
+	const FGameplayAbilityActorInfo* Info = GetCurrentActorInfo();
+	if (UAnimInstance* AnimInstance = Info ? Info->GetAnimInstance() : nullptr)
+	{
+		AnimInstance->Montage_JumpToSection(Section, MontageToPlay);
 	}
 }
 

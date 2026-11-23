@@ -21,7 +21,8 @@
 //   3. 각자   : 각 컴퓨터에서 각자 등록 (보스 등록과 같은 방식)
 //
 // [에디터] 레벨에 끌어다 놓기 → Location Tag 고르기 (Project Settings → Gameplay Tags에 Location.* 추가)
-//   게임 중에는 보이지 않는다. 에디터에서만 아이콘이 보인다.
+//   게임 중에는 보이지 않는다. 에디터에서만 아이콘과 방향 화살표가 보인다.
+//   방향을 쓰는 표시도 있다: Location.Raid.Entrance는 화살표의 오른쪽으로 플레이어를 벌려 세운다 (회전으로 조절)
 
 #pragma once
 
@@ -31,6 +32,7 @@
 #include "LOALocationMarker.generated.h"
 
 class UBillboardComponent;
+class UArrowComponent;
 
 UCLASS()
 class LOA_API ALOALocationMarker : public AActor
@@ -57,5 +59,9 @@ protected:
 	/** 에디터에서만 보이는 아이콘 */
 	UPROPERTY()
 	TObjectPtr<UBillboardComponent> EditorIcon;
+
+	/** 에디터에서만 보이는 방향 화살표 (표시가 보는 방향) */
+	UPROPERTY()
+	TObjectPtr<UArrowComponent> EditorArrow;
 #endif
 };

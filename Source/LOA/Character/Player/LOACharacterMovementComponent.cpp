@@ -2,6 +2,7 @@
 
 #include "Character/Player/LOACharacterMovementComponent.h"
 #include "Character/Player/LOARootMotionSource_Arc.h"
+#include "AbilitySystem/Attributes/LOAAttributeSet_Player.h"
 #include "Core/LOACollisionChannels.h"
 #include "Core/LOAGameplayTags.h"
 #include "Core/LOALog.h"
@@ -13,6 +14,7 @@
 #include "Engine/World.h"
 #include "Engine/OverlapResult.h"
 #include "GameFramework/Character.h"
+#include "GameFramework/PlayerState.h"
 #include "Net/UnrealNetwork.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(LOACharacterMovementComponent)
@@ -25,6 +27,7 @@ void ULOACharacterMovementComponent::BeginPlay()
 	if (const UCapsuleComponent* Capsule = CharacterOwner ? CharacterOwner->GetCapsuleComponent() : nullptr)
 	{
 		DefaultBodyBlockResponse = Capsule->GetCollisionResponseToChannel(LOACollision::BodyBlock);
+		DefaultRaidEdgeResponse = Capsule->GetCollisionResponseToChannel(LOACollision::RaidEdge);
 	}
 }
 
@@ -38,7 +41,10 @@ void ULOACharacterMovementComponent::UpdateCharacterStateBeforeMovement(float De
 		return;
 	}
 
-	// ① 관통 중 (State.PassThroughBodyBlock): 막지도 밀지도 않는다.
+	// ⓪ 레이드 가장자리 벽: CC 궤적 중에만 통과 (헤더 [레이드 가장자리 벽])
+	SetIgnoreRaidEdges(IsCrowdControlMoving());
+
+	// ① 관통 중 (State.Body.PassThroughBodyBlock): 막지도 밀지도 않는다.
 	if (IsPassingThroughBodyBlockers())
 	{
 		bInsideBodyBlocker = false;
@@ -127,10 +133,33 @@ const UAbilitySystemComponent* ULOACharacterMovementComponent::GetOwnerAbilitySy
 	return AbilityOwner ? AbilityOwner->GetAbilitySystemComponent() : nullptr;
 }
 
+FVector ULOACharacterMovementComponent::ConstrainInputAcceleration(const FVector& InputAcceleration) const
+{
+	// 이동 금지 태그가 있으면 걷기 입력을 버린다. 서버도 같은 판단 → 이동 금지를 서버가 지킨다
+	//   핑 동안(태그가 아직 클라에 안 옴) 클라가 걸으면 서버는 받아들이지 않고 보정으로 되돌린다. (정상 클라에서도 잠깐 생길 수 있음)
+	const UAbilitySystemComponent* ASC = GetOwnerAbilitySystem();
+	if (ASC && ASC->HasMatchingGameplayTag(LOAGameplayTags::State_Block_Move))
+	{
+		return FVector::ZeroVector;
+	}
+
+	return Super::ConstrainInputAcceleration(InputAcceleration);
+}
+
+float ULOACharacterMovementComponent::GetMaxSpeed() const
+{
+	// 엔진 값 (걷기면 BP 걷기 속도, 없음이면 0 …) × (1 + 이동속도 증가). 헤더 [이동속도 증가]
+	//   ASC가 아직 없거나(PlayerState 도착 전) 플레이어 스탯창이 없으면 0 → 엔진 값 그대로
+	const float EngineMaxSpeed = Super::GetMaxSpeed();
+	const UAbilitySystemComponent* ASC = GetOwnerAbilitySystem();
+	const float Bonus = ASC ? ASC->GetNumericAttribute(ULOAAttributeSet_Player::GetMoveSpeedBonusAttribute()) : 0.f;
+	return EngineMaxSpeed * (1.f + FMath::Max(Bonus, 0.f));
+}
+
 bool ULOACharacterMovementComponent::IsPassingThroughBodyBlockers() const
 {
 	const UAbilitySystemComponent* ASC = GetOwnerAbilitySystem();
-	return ASC && ASC->HasMatchingGameplayTag(LOAGameplayTags::State_PassThroughBodyBlock);
+	return ASC && ASC->HasMatchingGameplayTag(LOAGameplayTags::State_Body_PassThroughBodyBlock);
 }
 
 // =============================================================================
@@ -168,7 +197,15 @@ void ULOACharacterMovementComponent::StartCrowdControlMove(const FVector& Direct
 	NewMove.StartHeight = FMath::Max(0.f, StartHeight);
 	NewMove.ApexHeight = FMath::Max(0.f, ApexHeight);
 	NewMove.Duration = Duration;
+	NewMove.StartLocation = UpdatedComponent ? UpdatedComponent->GetComponentLocation() : CharacterOwner->GetActorLocation();	// 맞은 사람 컴퓨터의 도착 지점 기준
 	CrowdControlMove = NewMove;
+
+	// 유예: 맞은 사람 컴퓨터는 편도 늦게, 자기 자리에서 서버 도착 지점으로 궤적을 건다 → 그 이동이 다 올 때까지 보정하지 않는다
+	//   (헤더 [내 자리에서 출발, 서버와 같은 자리에 도착]. 리슨 호스트 본인은 서버 이동이라 상관없음)
+	const APlayerState* PlayerState = CharacterOwner->GetPlayerState();
+	const double Ping = PlayerState ? PlayerState->GetPingInMilliseconds() * 0.001 : 0.0;
+	CrowdControlTrustEndTime = GetWorld()->GetTimeSeconds() + Duration + Ping + CrowdControlTrustExtraTime;
+	CrowdControlMaxDiff = 0.f;
 
 	// 서버도 같은 숫자로 건다 (맞은 사람 컴퓨터는 OnRep_CrowdControlMove에서)
 	ApplyCrowdControlMoveLocally(CrowdControlMove);
@@ -184,6 +221,48 @@ void ULOACharacterMovementComponent::StopCrowdControlMove()
 	CrowdControlMove.bActive = false;
 	CrowdControlMove.Sequence = static_cast<uint8>(CrowdControlMove.Sequence + 1);
 	RemoveCrowdControlMoveLocally();
+}
+
+bool ULOACharacterMovementComponent::ServerExceedsAllowablePositionError(float ClientTimeStamp, float DeltaTime, const FVector& Accel,
+	const FVector& ClientWorldLocation, const FVector& RelativeClientLocation, UPrimitiveComponent* ClientMovementBase, FName ClientBaseBoneName, uint8 ClientMovementMode)
+{
+	const bool bEngineError = Super::ServerExceedsAllowablePositionError(ClientTimeStamp, DeltaTime, Accel, ClientWorldLocation, RelativeClientLocation,
+		ClientMovementBase, ClientBaseBoneName, ClientMovementMode);
+
+	// CC 유예가 없으면 엔진 그대로
+	if (CrowdControlTrustEndTime <= 0.0)
+	{
+		return bEngineError;
+	}
+
+	// 헤더 [내 자리에서 출발, 서버와 같은 자리에 도착]
+	const float Distance = FVector::Dist(UpdatedComponent->GetComponentLocation(), ClientWorldLocation);
+
+	// ① 유예 중: 보정 안 보냄 (클라 궤적은 편도 늦고 도착점으로 휘어 있다). 너무 크면(회피·순간이동) 바로 보정하고 유예 끝
+	if (GetWorld()->GetTimeSeconds() < CrowdControlTrustEndTime)
+	{
+		CrowdControlMaxDiff = FMath::Max(CrowdControlMaxDiff, Distance);
+		if (Distance > CrowdControlFlightLimit)
+		{
+			LOA_LOG(CharacterOwner, Warning, TEXT("[CrowdControl] %.0fcm from server during CC (max %.0f). Correcting now"),
+				Distance, CrowdControlFlightLimit);
+			CrowdControlTrustEndTime = 0.0;
+			return true;
+		}
+		return false;
+	}
+
+	// ② 유예 뒤 첫 이동: 엔진 기본 검사로 돌아간다. 끝 차이를 로그로 (같은 자리에 도착했으면 0에 가깝다)
+	CrowdControlTrustEndTime = 0.0;
+	if (bEngineError)
+	{
+		LOA_LOG(CharacterOwner, Warning, TEXT("[CrowdControl] end: %.0fcm from server (max during CC %.0f) -> corrected"), Distance, CrowdControlMaxDiff);
+	}
+	else
+	{
+		LOA_LOG(CharacterOwner, Log, TEXT("[CrowdControl] end: %.0fcm from server (max during CC %.0f) -> same"), Distance, CrowdControlMaxDiff);
+	}
+	return bEngineError;
 }
 
 void ULOACharacterMovementComponent::OnRep_CrowdControlMove()
@@ -208,10 +287,35 @@ void ULOACharacterMovementComponent::ApplyCrowdControlMoveLocally(const FLOACrow
 	// 이전 궤적은 버린다 (공중에서 또 맞음 / 경직 중 또 경직)
 	RemoveCrowdControlMoveLocally();
 
+	// 수평으로 갈 길: 서버는 방향 × 거리 그대로
+	//   맞은 사람 컴퓨터는 지금 내 자리 → 서버 도착 지점 (헤더 [내 자리에서 출발, 서버와 같은 자리에 도착])
+	FVector Travel = FVector(Move.Direction).GetSafeNormal2D() * Move.Distance;
+	if (GetOwnerRole() == ROLE_AutonomousProxy)
+	{
+		const FVector MyLocation = UpdatedComponent ? UpdatedComponent->GetComponentLocation() : CharacterOwner->GetActorLocation();
+		const FVector ServerStart = Move.StartLocation;
+		const float StartGap = FVector::Dist2D(MyLocation, ServerStart);
+		if (StartGap > CrowdControlFlightLimit)
+		{
+			// 차이가 너무 큼 (핑 사이에 회피·순간이동) → 메우지 않고 서버 시작 위치로 한 번 옮긴 뒤 서버와 같은 궤적
+			//   Sweep: 사이에 벽·몸 막이가 있으면 거기서 멈춘다 (남은 차이는 서버 보정이 맞춘다)
+			LOA_LOG(CharacterOwner, Log, TEXT("[CrowdControl] %.0fcm from server start (max %.0f). Moving to the server start"),
+				StartGap, CrowdControlFlightLimit);
+			CharacterOwner->SetActorLocation(FVector(ServerStart.X, ServerStart.Y, MyLocation.Z), /*bSweep*/ true, nullptr, ETeleportType::TeleportPhysics);
+		}
+		else
+		{
+			// 도착 지점 = 서버 시작 위치 + 방향 × 거리. 높이는 서버 숫자 그대로 (수평만 맞춘다)
+			const FVector ServerEnd = ServerStart + Travel;
+			Travel = FVector(ServerEnd.X - MyLocation.X, ServerEnd.Y - MyLocation.Y, 0.f);
+		}
+	}
+
+	// 궤적은 지금 자리에서 처음부터 (늦게 받은 만큼 옮기기 없음)
 	TSharedPtr<FLOARootMotionSource_Arc> Arc = MakeShared<FLOARootMotionSource_Arc>();
 	Arc->InstanceName = TEXT("LOACrowdControl");	// 서버·내 컴퓨터 짝짓기(Matches)에 쓰인다 → 양쪽 같은 이름
-	Arc->Direction = Move.Direction;
-	Arc->Distance = Move.Distance;
+	Arc->Direction = Travel.GetSafeNormal2D();
+	Arc->Distance = Travel.Size2D();
 	Arc->StartHeight = Move.StartHeight;
 	Arc->ApexHeight = Move.ApexHeight;
 	Arc->Duration = Move.Duration;
@@ -268,6 +372,29 @@ float ULOACharacterMovementComponent::SlideAlongSurface(const FVector& Delta, fl
 	//    예) 보스 중심에서 30cm 옆을 겨냥해 회피 → 몸 막이에 닿은 자리에서 멈춤 (엔진 원래: 몸을 타고 돌아 옆으로 빠져나감)
 	//    땅 위면 위아래가 0이라 엔진이 그대로 0을 돌려준다 (안 움직임). 부딪힘 알림은 엔진이 이미 이 함수를 부르기 전에 보냈다
 	return Super::SlideAlongSurface(FVector(0.f, 0.f, Delta.Z), Time, Normal, Hit, bHandleImpact);
+}
+
+bool ULOACharacterMovementComponent::IsCrowdControlMoving()
+{
+	// 엔진은 끝난 루트 모션 소스(시간 다 됨·착지)를 목록에서 지운다 → 번호로 찾아서 있으면 아직 궤적 중
+	return ActiveCrowdControlSourceId != 0 && GetRootMotionSourceByID(ActiveCrowdControlSourceId).IsValid();
+}
+
+void ULOACharacterMovementComponent::SetIgnoreRaidEdges(bool bIgnore)
+{
+	if (bIgnore == bIgnoringRaidEdges)
+	{
+		return;
+	}
+
+	UCapsuleComponent* Capsule = CharacterOwner ? CharacterOwner->GetCapsuleComponent() : nullptr;
+	if (!Capsule)
+	{
+		return;
+	}
+
+	Capsule->SetCollisionResponseToChannel(LOACollision::RaidEdge, bIgnore ? ECR_Ignore : DefaultRaidEdgeResponse.GetValue());
+	bIgnoringRaidEdges = bIgnore;
 }
 
 void ULOACharacterMovementComponent::SetIgnoreBodyBlockers(bool bIgnore)
